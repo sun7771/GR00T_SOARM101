@@ -466,7 +466,10 @@ class Gr00tRobotInferenceClient:
 
     def _get_action_sync(self, observation_dict, lang: str):
         """同步获取动作块（在线程池中执行）"""
-        # 首先添加图像
+        timing_info = {}
+        
+        # 步骤1：图像预处理
+        preprocess_start = time.time()
         obs_dict = {}
         for key in self.camera_keys:
             img = observation_dict[key]
@@ -477,11 +480,14 @@ class Gr00tRobotInferenceClient:
             if img.shape[:2] != (224, 224):
                 img = cv2.resize(img, (224, 224), interpolation=cv2.INTER_LINEAR)
             obs_dict[f"video.{key}"] = img
+        timing_info['preprocess'] = (time.time() - preprocess_start) * 1000  # ms
 
         # 显示图像
         if self.show_images:
             view_img(obs_dict)
 
+        # 步骤2：数据打包
+        pack_start = time.time()
         # 将所有单个浮点值的 dict[str, float] 状态转换为单个数组
         state = np.array([observation_dict[k] for k in self.robot_state_keys])
         obs_dict["state.single_arm"] = state[:5].astype(np.float32)
@@ -498,10 +504,15 @@ class Gr00tRobotInferenceClient:
                     obs_dict[k] = obs_dict[k][:, np.newaxis, ...]
             else:
                 obs_dict[k] = [obs_dict[k]]  # [lang] -> [[lang]]
+        timing_info['pack'] = (time.time() - pack_start) * 1000  # ms
 
-        # 通过策略服务器获取动作块
+        # 步骤3：网络传输 + 服务器推理
+        network_start = time.time()
         action_chunk = self.policy.get_action(obs_dict)
-        
+        timing_info['network_inference'] = (time.time() - network_start) * 1000  # ms
+
+        # 步骤4：数据解析
+        parse_start = time.time()
         # 如果返回的是列表，提取第一个元素（动作数据字典）
         if isinstance(action_chunk, list) and len(action_chunk) > 0:
             action_data = action_chunk[0]  # 获取第一个元素
@@ -521,7 +532,10 @@ class Gr00tRobotInferenceClient:
                     action_dict = self._convert_to_lerobot_action(reformatted_chunk, i)
                     lerobot_actions.append(action_dict)
                 
-                return lerobot_actions
+                timing_info['parse'] = (time.time() - parse_start) * 1000  # ms
+                timing_info['total'] = timing_info['preprocess'] + timing_info['pack'] + timing_info['network_inference'] + timing_info['parse']
+                
+                return lerobot_actions, timing_info
             else:
                 raise ValueError(f"意外的动作数据格式: {action_data}")
         
@@ -532,7 +546,9 @@ class Gr00tRobotInferenceClient:
             for i in range(action_horizon):
                 action_dict = self._convert_to_lerobot_action(action_chunk, i)
                 lerobot_actions.append(action_dict)
-            return lerobot_actions
+            timing_info['parse'] = 0
+            timing_info['total'] = timing_info['preprocess'] + timing_info['pack'] + timing_info['network_inference']
+            return lerobot_actions, timing_info
         
         raise TypeError(f"不支持的 action_chunk 类型: {type(action_chunk)}")
 
@@ -588,7 +604,7 @@ class EvalConfig:
     policy_host: str = "localhost"  # gr00t服务器的主机地址
     policy_port: int = 5555  # gr00t服务器的端口
     # todo：：调整动作块的长度
-    action_horizon: int = 12# 从动作块中执行的动作数量
+    action_horizon: int = 16# 从动作块中执行的动作数量
     lang_instruction: str = "Grab pens and place into pen holder."
     play_sounds: bool = False  # 是否播放声音
     timeout: int = 60  # 超时时间（秒）
@@ -601,7 +617,7 @@ class EvalConfig:
     
     # 平滑算法配置 
     smoothing_method: str = "savgol"  # 平滑方法: 'ema', 'moving_avg', 'savgol', 'dct'
-    smoothing_window_size: int = 10 # 平滑窗口大小
+    smoothing_window_size: int = 15 # 平滑窗口大小
     enable_interpolation: bool = True  # 是否启用动作块内插值
     interpolation_steps: int = 10 # 每个动作之间的插值步数
     
@@ -763,6 +779,15 @@ async def eval_async(cfg: EvalConfig):
     # 异步任务统计
     async_obs_time_list = []
     async_policy_time_list = []
+    
+    # 详细性能统计
+    timing_stats = {
+        'preprocess': [],
+        'pack': [],
+        'network_inference': [],
+        'parse': [],
+        'total': []
+    }
     # ------------------------------------
 
     # 步骤4：运行异步评估循环
@@ -776,13 +801,20 @@ async def eval_async(cfg: EvalConfig):
             obs_time = time.time() - obs_start_time
             async_obs_time_list.append(obs_time)
             
-            # 异步获取动作块（这部分包含网络延迟）
+            # 异步获取动作块（包含详细计时）
             policy_start_time = time.time()
-            action_chunk = await policy.get_action_async(observation_dict, language_instruction)
+            action_chunk, timing_info = await policy.get_action_async(observation_dict, language_instruction)
             policy_time = time.time() - policy_start_time
             async_policy_time_list.append(policy_time)
             
-            # 记录网络延迟
+            # 记录详细性能统计
+            for key in timing_stats:
+                if key in timing_info:
+                    timing_stats[key].append(timing_info[key])
+                    if len(timing_stats[key]) > max_latency_history:
+                        timing_stats[key].pop(0)
+            
+            # 记录总网络延迟
             network_latency_list.append(policy_time)
             if len(network_latency_list) > max_latency_history:
                 network_latency_list.pop(0)
@@ -847,6 +879,13 @@ async def eval_async(cfg: EvalConfig):
                 avg_obs_time = np.mean(async_obs_time_list[-10:]) * 1000 if async_obs_time_list else 0
                 avg_policy_time = np.mean(async_policy_time_list[-10:]) * 1000 if async_policy_time_list else 0
                 
+                # 计算详细性能统计
+                avg_preprocess = np.mean(timing_stats['preprocess']) if timing_stats['preprocess'] else 0
+                avg_pack = np.mean(timing_stats['pack']) if timing_stats['pack'] else 0
+                avg_network = np.mean(timing_stats['network_inference']) if timing_stats['network_inference'] else 0
+                avg_parse = np.mean(timing_stats['parse']) if timing_stats['parse'] else 0
+                avg_total = np.mean(timing_stats['total']) if timing_stats['total'] else 0
+                
                 print(f"\n{'='*60}")
                 print(f"[Loop {loop_count}] 异步性能统计")
                 print(f"{'='*60}")
@@ -859,6 +898,12 @@ async def eval_async(cfg: EvalConfig):
                 print(f"  动作执行时间: {action_execution_time*1000:.2f} ms")
                 print(f"  空闲时间: {idle_time*1000:.2f} ms")
                 print(f"  动作块利用率: {action_chunk_utilization:.1f}%")
+                print(f"\n策略推理详细耗时 (最近{len(timing_stats['total'])}次):")
+                print(f"  ├─ 图像预处理: {avg_preprocess:.2f} ms (BGR→RGB, resize)")
+                print(f"  ├─ 数据打包: {avg_pack:.2f} ms (格式转换)")
+                print(f"  ├─ 网络+推理: {avg_network:.2f} ms (传输+模型推理)")
+                print(f"  ├─ 数据解析: {avg_parse:.2f} ms (结果处理)")
+                print(f"  └─ 总计: {avg_total:.2f} ms")
                 print(f"\n网络延迟统计 (最近{len(network_latency_list)}次):")
                 print(f"  平均延迟: {avg_latency:.2f} ms")
                 print(f"  最小延迟: {min_latency:.2f} ms")
