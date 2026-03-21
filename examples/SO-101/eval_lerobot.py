@@ -815,7 +815,7 @@ class EvalConfig:
     policy_host: str = "localhost"  # gr00t服务器的主机地址
     policy_port: int = 5555  # gr00t服务器的端口
     # todo：：调整动作块的长度
-    action_horizon: int = 16# 从动作块中执行的动作数量
+    action_horizon: int = 10# 从动作块中执行的动作数量
     lang_instruction: str = "Grab pens and place into pen holder."
     play_sounds: bool = False  # 是否播放声音
     timeout: int = 60  # 超时时间（秒）
@@ -828,9 +828,9 @@ class EvalConfig:
     
     # 平滑算法配置 
     smoothing_method: str = "savgol"  # 平滑方法: 'ema', 'moving_avg', 'savgol', 'dct'
-    smoothing_window_size: int = 15 # 平滑窗口大小
+    smoothing_window_size: int = 10 # 平滑窗口大小
     enable_interpolation: bool = True  # 是否启用动作块内插值
-    interpolation_steps: int = 2 # 每个动作之间的插值步数
+    interpolation_steps: int = 10 # 每个动作之间的插值步数
     
     # DCT平滑配置
     dct_keep_ratio: float = 0.3  # DCT保留低频系数的比例 (0.1-0.9)，越小越平滑
