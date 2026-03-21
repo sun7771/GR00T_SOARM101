@@ -376,10 +376,10 @@ class AdaptiveOptimizer:
     
     def adjust(self, action_chunk_utilization, loop_fps, policy_time):
         """根据性能调整参数"""
+        self.loop_count += 1
+        
         if not self.should_adjust():
             return False
-        
-        self.loop_count += 1
         
         # 记录历史数据
         self.utilization_history.append(action_chunk_utilization)
@@ -813,17 +813,17 @@ class EvalConfig:
     play_sounds: bool = False  # 是否播放声音
     timeout: int = 60  # 超时时间（秒）
     show_images: bool = False  # 是否显示图像
-    use_sync: bool = True  # 是否使用同步版本（默认使用异步优化版本）
-    enable_video_stream: bool = True  # 是否启用视频流服务器
+    use_sync: bool = False  # 是否使用同步版本（默认使用异步优化版本）
+    enable_video_stream: bool = True  # 是否启用视频流服务
     video_stream_port: int = 5000  # 视频流服务器端口
 
-    ctrl_period: float =0.001  # 控制周期，单位为秒 0.001s=1000Hz
+    ctrl_period: float =0.003  # 控制周期，单位为秒 0.003s=333Hz
     
     # 平滑算法配置 
     smoothing_method: str = "savgol"  # 平滑方法: 'ema', 'moving_avg', 'savgol', 'dct'
     smoothing_window_size: int = 15 # 平滑窗口大小
     enable_interpolation: bool = True  # 是否启用动作块内插值
-    interpolation_steps: int = 10 # 每个动作之间的插值步数
+    interpolation_steps: int = 2 # 每个动作之间的插值步数
     
     # DCT平滑配置
     dct_keep_ratio: float = 0.3  # DCT保留低频系数的比例 (0.1-0.9)，越小越平滑
@@ -843,12 +843,12 @@ class EvalConfig:
     
     # 动态调整配置
     enable_adaptive: bool = True  # 是否启用动态调整
-    adaptive_interval: int = 10  # 动态调整间隔（循环次数）
+    adaptive_interval: int = 5  # 动态调整间隔（循环次数）
     min_interpolation_steps: int = 2  # 最小插值步数
     max_interpolation_steps: int = 15  # 最大插值步数
     min_ctrl_period: float = 0.0005  # 最小控制周期（2000Hz）
     max_ctrl_period: float = 0.005  # 最大控制周期（200Hz）
-    target_utilization: float = 0.4  # 目标动作块利用率（40%）
+    target_utilization: float = 0.8  # 目标动作块利用率（80%）
 
 
 def rad_speed_limit(target_pos, current_pos, max_delta_pos=0.5):
@@ -1020,9 +1020,13 @@ async def eval_async(cfg: EvalConfig):
         while True:
             loop_start_time = time.time()
             
-            # 异步获取实时观测数据（使用预取器）
+            # 直接获取最新观测数据（不使用预取器缓存，避免动作回退）
             obs_start_time = time.time()
-            observation_dict = await obs_prefetcher.get_observation()
+            loop = asyncio.get_event_loop()
+            observation_dict = await loop.run_in_executor(
+                executor,
+                lambda: robot.get_observation()
+            )
             obs_time = time.time() - obs_start_time
             async_obs_time_list.append(obs_time)
             
