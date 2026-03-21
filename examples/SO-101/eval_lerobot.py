@@ -45,6 +45,7 @@ python -m lerobot.replay \
 import asyncio
 import logging
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pprint import pformat
@@ -224,9 +225,10 @@ class ActionInterpolator:
 class ObservationPrefetcher:
     """观测数据预取器 - 在后台异步获取观测数据"""
     
-    def __init__(self, robot, executor):
+    def __init__(self, robot, executor, robot_lock):
         self.robot = robot
         self.executor = executor
+        self.robot_lock = robot_lock
         self.current_obs = None
         self.prefetch_task = None
         self.loop = None
@@ -244,11 +246,16 @@ class ObservationPrefetcher:
         self.prefetch_task = asyncio.create_task(self._get_observation_async())
         
     async def _get_observation_async(self):
-        """异步获取观测数据"""
+        """异步获取观测数据（使用线程锁保护串口访问）"""
         loop = asyncio.get_event_loop()
+        
+        def get_observation_with_lock():
+            with self.robot_lock:
+                return self.robot.get_observation()
+        
         return await loop.run_in_executor(
             self.executor,
-            self.robot.get_observation
+            get_observation_with_lock
         )
     
     async def get_observation(self):
@@ -429,16 +436,16 @@ class EvalConfig:
     policy_host: str = "localhost"  # gr00t服务器的主机地址
     policy_port: int = 5555  # gr00t服务器的端口
     # todo：：调整动作块的长度
-    action_horizon: int = 16# 从动作块中执行的动作数量
+    action_horizon: int = 40# 从动作块中执行的动作数量
     lang_instruction: str = "Grab pens and place into pen holder."
     play_sounds: bool = False  # 是否播放声音
     timeout: int = 60  # 超时时间（秒）
     show_images: bool = False  # 是否显示图像
     use_sync: bool = False  # 是否使用同步版本（默认使用异步优化版本）
 
-    ctrl_period: float = 0.001  # 控制周期，单位为秒 0.001s=1000Hz
+    ctrl_period: float = 0.003 - 0.002  # 控制周期，单位为秒 0.001s=1000Hz
     
-    # 平滑算法配置
+    # 平滑算法配置 
     smoothing_method: str = "savgol"  # 平滑方法: 'ema', 'moving_avg', 'savgol', 'dct'
     smoothing_window_size: int = 10 # 平滑窗口大小
     enable_interpolation: bool = True  # 是否启用动作块内插值
@@ -511,12 +518,15 @@ async def eval_async(cfg: EvalConfig):
         blocking=True,
     )
 
-    # 步骤3：初始化观测预取器
+    # 步骤3：创建线程锁保护机器人串口访问
+    robot_lock = threading.Lock()
+    
+    # 步骤4：初始化观测预取器
     executor = ThreadPoolExecutor(max_workers=4)
-    obs_prefetcher = ObservationPrefetcher(robot, executor)
+    obs_prefetcher = ObservationPrefetcher(robot, executor, robot_lock)
     await obs_prefetcher.start()
     
-    # 步骤4：初始化平滑器和插值器
+    # 步骤5：初始化平滑器和插值器
     action_smoother = ActionSmoother(
         robot_state_keys,
         window_size=cfg.smoothing_window_size,
@@ -634,7 +644,8 @@ async def eval_async(cfg: EvalConfig):
                 
                 previous_action = smoothed_action.copy()
                 
-                robot.send_action(smoothed_action)
+                with robot_lock:
+                    robot.send_action(smoothed_action)
                 time.sleep(cfg.ctrl_period)
                 
                 # 统计动作执行频率
@@ -657,6 +668,11 @@ async def eval_async(cfg: EvalConfig):
                 actual_action_count = len(action_chunk) if cfg.enable_interpolation else cfg.action_horizon
                 total_action_fps = (print_interval * actual_action_count) / dt
                 
+                # 计算动作块执行时间和利用率
+                action_execution_time = actual_action_count * cfg.ctrl_period
+                idle_time = dt - action_execution_time
+                action_chunk_utilization = (action_execution_time / dt) * 100 if dt > 0 else 0
+                
                 # 计算网络延迟统计
                 avg_latency = np.mean(network_latency_list) * 1000  # 毫秒
                 min_latency = np.min(network_latency_list) * 1000
@@ -673,6 +689,11 @@ async def eval_async(cfg: EvalConfig):
                 print(f"异步获取观测耗时: {avg_obs_time:.2f} ms (平均)")
                 print(f"异步策略推理耗时: {avg_policy_time:.2f} ms (平均)")
                 print(f"总循环耗时: {dt*1000:.2f} ms")
+                print(f"\n动作块利用统计:")
+                print(f"  动作块长度: {cfg.action_horizon} | 插值后: {actual_action_count}")
+                print(f"  动作执行时间: {action_execution_time*1000:.2f} ms")
+                print(f"  空闲时间: {idle_time*1000:.2f} ms")
+                print(f"  动作块利用率: {action_chunk_utilization:.1f}%")
                 print(f"\n网络延迟统计 (最近{len(network_latency_list)}次):")
                 print(f"  平均延迟: {avg_latency:.2f} ms")
                 print(f"  最小延迟: {min_latency:.2f} ms")
@@ -838,6 +859,11 @@ def eval_sync(cfg: EvalConfig):
             actual_action_count = len(action_chunk) if cfg.enable_interpolation else cfg.action_horizon
             total_action_fps = (print_interval * actual_action_count) / dt
             
+            # 计算动作块执行时间和利用率
+            action_execution_time = actual_action_count * cfg.ctrl_period
+            idle_time = dt - action_execution_time
+            action_chunk_utilization = (action_execution_time / dt) * 100 if dt > 0 else 0
+            
             # 计算网络延迟统计
             avg_latency = np.mean(network_latency_list) * 1000  # 毫秒
             min_latency = np.min(network_latency_list) * 1000
@@ -850,6 +876,11 @@ def eval_sync(cfg: EvalConfig):
             print(f"获取观测耗时: {obs_time*1000:.2f} ms")
             print(f"策略推理耗时: {policy_time*1000:.2f} ms")
             print(f"总循环耗时: {dt*1000:.2f} ms")
+            print(f"\n动作块利用统计:")
+            print(f"  动作块长度: {cfg.action_horizon} | 插值后: {actual_action_count}")
+            print(f"  动作执行时间: {action_execution_time*1000:.2f} ms")
+            print(f"  空闲时间: {idle_time*1000:.2f} ms")
+            print(f"  动作块利用率: {action_chunk_utilization:.1f}%")
             print(f"\n网络延迟统计 (最近{len(network_latency_list)}次):")
             print(f"  平均延迟: {avg_latency:.2f} ms")
             print(f"  最小延迟: {min_latency:.2f} ms")
