@@ -86,7 +86,7 @@ from gr00t.eval.service import ExternalRobotInferenceClient
 class ActionSmoother:
     """高级动作平滑器 - 使用多种平滑算法减少抖动"""
     
-    def __init__(self, robot_state_keys, window_size=5, method='ema', dct_keep_ratio=0.5, savgol_window_length=5):
+    def __init__(self, robot_state_keys, window_size=5, method='ema', dct_keep_ratio=0.5, savgol_window_length=5, kalman_process_noise=0.01, kalman_measurement_noise=0.1):
         self.robot_state_keys = robot_state_keys
         self.window_size = window_size
         self.method = method
@@ -94,6 +94,11 @@ class ActionSmoother:
         self.savgol_window_length = savgol_window_length
         self.history = {key: [] for key in robot_state_keys}
         self.current_action = None
+        
+        self.kalman_process_noise = kalman_process_noise
+        self.kalman_measurement_noise = kalman_measurement_noise
+        self.kalman_x = {key: None for key in robot_state_keys}
+        self.kalman_P = {key: None for key in robot_state_keys}
         
     def smooth(self, action_dict, joint_alpha_map):
         """应用平滑算法"""
@@ -119,6 +124,11 @@ class ActionSmoother:
                     )
                 elif self.method == 'dct':
                     smoothed_action[key] = self._dct_smooth(
+                        action_dict[key], 
+                        key
+                    )
+                elif self.method == 'kalman':
+                    smoothed_action[key] = self._kalman_smooth(
                         action_dict[key], 
                         key
                     )
@@ -192,6 +202,30 @@ class ActionSmoother:
         smoothed_signal = idct(dct_coeffs_filtered, type=2, norm='ortho')
         
         return smoothed_signal[-1]
+    
+    def _kalman_smooth(self, new_value, key):
+        """卡尔曼滤波平滑 - 状态估计滤波器，适合处理带噪声的观测值"""
+        Q = self.kalman_process_noise
+        R = self.kalman_measurement_noise
+        
+        if self.kalman_x[key] is None:
+            self.kalman_x[key] = new_value
+            self.kalman_P[key] = 1.0
+            return new_value
+        
+        x_pred = self.kalman_x[key]
+        P_pred = self.kalman_P[key] + Q
+        
+        K = P_pred / (P_pred + R)
+        
+        self.kalman_x[key] = x_pred + K * (new_value - x_pred)
+        self.kalman_P[key] = (1 - K) * P_pred
+        
+        self.history[key].append(self.kalman_x[key])
+        if len(self.history[key]) > self.window_size:
+            self.history[key].pop(0)
+        
+        return self.kalman_x[key]
 
 
 class ActionInterpolator:
@@ -822,7 +856,7 @@ class EvalConfig:
     policy_host: str = "localhost"  # gr00t服务器的主机地址
     policy_port: int = 5555  # gr00t服务器的端口
     # todo：：调整动作块的长度
-    action_horizon: int = 10# 从动作块中执行的动作数量
+    action_horizon: int = 4# 从动作块中执行的动作数量
     lang_instruction: str = "Grab pens and place into pen holder."
     play_sounds: bool = False  # 是否播放声音
     timeout: int = 60  # 超时时间（秒）
@@ -834,7 +868,7 @@ class EvalConfig:
     ctrl_period: float =0.003  # 控制周期，单位为秒 0.003s=333Hz
     
     # 平滑算法配置 
-    smoothing_method: str = "savgol"  # 平滑方法: 'ema', 'moving_avg', 'savgol', 'dct'
+    smoothing_method: str = "savgol"  # 平滑方法: 'ema', 'moving_avg', 'savgol', 'dct', 'kalman'
     smoothing_window_size: int = 10  # 平滑窗口大小
     savgol_window_length: int = 7  # Savitzky-Golay滤波窗口长度（必须为奇数且>=3）
     enable_interpolation: bool = True  # 是否启用动作块内插值
@@ -842,6 +876,10 @@ class EvalConfig:
     
     # DCT平滑配置
     dct_keep_ratio: float = 0.3  # DCT保留低频系数的比例 (0.1-0.9)，越小越平滑
+    
+    # 卡尔曼滤波配置
+    kalman_process_noise: float = 0.05  # 过程噪声Q，越大响应越快但噪声更多
+    kalman_measurement_noise: float = 0.05  # 测量噪声R，越大平滑效果越强
     
     # 速度限制配置（减小以减少抖动）
     max_delta_pos: float = 0.15  # 最大关节角度变化（弧度）
@@ -949,7 +987,9 @@ async def eval_async(cfg: EvalConfig):
         window_size=cfg.smoothing_window_size,
         method=cfg.smoothing_method,
         dct_keep_ratio=cfg.dct_keep_ratio,
-        savgol_window_length=cfg.savgol_window_length
+        savgol_window_length=cfg.savgol_window_length,
+        kalman_process_noise=cfg.kalman_process_noise,
+        kalman_measurement_noise=cfg.kalman_measurement_noise
     )
     action_interpolator = ActionInterpolator(
         robot_state_keys,
@@ -964,6 +1004,9 @@ async def eval_async(cfg: EvalConfig):
     print(f"  最大角度变化: {cfg.max_delta_pos} rad")
     if cfg.smoothing_method == 'dct':
         print(f"  DCT保留低频比例: {cfg.dct_keep_ratio}")
+    if cfg.smoothing_method == 'kalman':
+        print(f"  过程噪声Q: {cfg.kalman_process_noise}")
+        print(f"  测量噪声R: {cfg.kalman_measurement_noise}")
 
     previous_action = None
     
@@ -986,7 +1029,9 @@ async def eval_async(cfg: EvalConfig):
         window_size=cfg.smoothing_window_size,
         method=cfg.smoothing_method,
         dct_keep_ratio=cfg.dct_keep_ratio,
-        savgol_window_length=cfg.savgol_window_length
+        savgol_window_length=cfg.savgol_window_length,
+        kalman_process_noise=cfg.kalman_process_noise,
+        kalman_measurement_noise=cfg.kalman_measurement_noise
     )
     action_interpolator = ActionInterpolator(
         robot_state_keys,
@@ -1001,6 +1046,9 @@ async def eval_async(cfg: EvalConfig):
     print(f"  最大角度变化: {cfg.max_delta_pos} rad")
     if cfg.smoothing_method == 'dct':
         print(f"  DCT保留低频比例: {cfg.dct_keep_ratio}")
+    if cfg.smoothing_method == 'kalman':
+        print(f"  过程噪声Q: {cfg.kalman_process_noise}")
+        print(f"  测量噪声R: {cfg.kalman_measurement_noise}")
     
     # 步骤7：初始化动态优化器
     adaptive_optimizer = AdaptiveOptimizer(cfg)
@@ -1312,7 +1360,10 @@ def eval_sync(cfg: EvalConfig):
         robot_state_keys,
         window_size=cfg.smoothing_window_size,
         method=cfg.smoothing_method,
-        savgol_window_length=cfg.savgol_window_length
+        dct_keep_ratio=cfg.dct_keep_ratio,
+        savgol_window_length=cfg.savgol_window_length,
+        kalman_process_noise=cfg.kalman_process_noise,
+        kalman_measurement_noise=cfg.kalman_measurement_noise
     )
     action_interpolator = ActionInterpolator(
         robot_state_keys,
