@@ -55,6 +55,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.fftpack import dct, idct
 from scipy.signal import savgol_filter
+from flask import Flask, Response, render_template_string
 from lerobot.cameras.opencv.configuration_opencv import (  # noqa: F401
     OpenCVCameraConfig,
 )
@@ -280,6 +281,154 @@ class ObservationPrefetcher:
             self.prefetch_task.cancel()
 
 
+class VideoStreamServer:
+    """视频流服务器 - 在后台提供网页访问摄像头画面"""
+    
+    def __init__(self, robot, robot_lock, camera_keys, port=5000):
+        self.robot = robot
+        self.robot_lock = robot_lock
+        self.camera_keys = camera_keys
+        self.port = port
+        self.latest_frames = {}
+        self.frame_lock = threading.Lock()
+        self.app = Flask(__name__)
+        self.server_thread = None
+        self.running = False
+        
+        self._setup_routes()
+    
+    def _setup_routes(self):
+        """设置Flask路由"""
+        
+        HTML_TEMPLATE = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Robot Camera Stream</title>
+            <style>
+                body {
+                    font-family: Arial, sans-serif;
+                    margin: 20px;
+                    background-color: #f0f0f0;
+                }
+                h1 {
+                    color: #333;
+                    text-align: center;
+                }
+                .camera-container {
+                    display: flex;
+                    flex-wrap: wrap;
+                    justify-content: center;
+                    gap: 20px;
+                    margin-top: 20px;
+                }
+                .camera-box {
+                    background: white;
+                    padding: 15px;
+                    border-radius: 10px;
+                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                }
+                .camera-box h2 {
+                    margin-top: 0;
+                    color: #666;
+                    font-size: 18px;
+                }
+                img {
+                    display: block;
+                    max-width: 100%;
+                    height: auto;
+                    border-radius: 5px;
+                }
+                .info {
+                    text-align: center;
+                    color: #666;
+                    margin-top: 20px;
+                }
+            </style>
+        </head>
+        <body>
+            <h1>🤖 Robot Camera Stream</h1>
+            <div class="camera-container">
+                {% for camera in camera_keys %}
+                <div class="camera-box">
+                    <h2>{{ camera }}</h2>
+                    <img src="/video_feed/{{ camera }}" alt="{{ camera }}">
+                </div>
+                {% endfor %}
+            </div>
+            <div class="info">
+                <p>Refresh rate: ~30 FPS | Resolution: 640x480</p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        @self.app.route('/')
+        def index():
+            return render_template_string(HTML_TEMPLATE, camera_keys=self.camera_keys)
+        
+        @self.app.route('/video_feed/<camera_key>')
+        def video_feed(camera_key):
+            return Response(self._generate_stream(camera_key),
+                          mimetype='multipart/x-mixed-replace; boundary=frame')
+    
+    def _generate_stream(self, camera_key):
+        """生成MJPEG视频流"""
+        while self.running:
+            with self.frame_lock:
+                if camera_key in self.latest_frames:
+                    frame = self.latest_frames[camera_key]
+                    # 将BGR转换为RGB（OpenCV默认使用BGR，网页需要RGB）
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    ret, buffer = cv2.imencode('.jpg', frame_rgb, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    if ret:
+                        frame_bytes = buffer.tobytes()
+                        yield (b'--frame\r\n'
+                               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            time.sleep(0.033)
+    
+    def update_frames(self):
+        """后台线程：持续更新摄像头帧"""
+        while self.running:
+            try:
+                with self.robot_lock:
+                    observation = self.robot.get_observation()
+                
+                with self.frame_lock:
+                    for key in self.camera_keys:
+                        if key in observation:
+                            frame = observation[key]
+                            if isinstance(frame, np.ndarray):
+                                self.latest_frames[key] = frame.copy()
+            except Exception as e:
+                print(f"Error capturing frame: {e}")
+                time.sleep(0.1)
+            
+            time.sleep(0.033)
+    
+    def start(self):
+        """启动视频流服务器"""
+        self.running = True
+        
+        # 启动帧更新线程
+        self.update_thread = threading.Thread(target=self.update_frames, daemon=True)
+        self.update_thread.start()
+        
+        # 启动Flask服务器（在单独线程中）
+        def run_flask():
+            self.app.run(host='0.0.0.0', port=self.port, debug=False, threaded=True)
+        
+        self.server_thread = threading.Thread(target=run_flask, daemon=True)
+        self.server_thread.start()
+        
+        print(f"✓ Video stream server started at http://0.0.0.0:{self.port}")
+        print(f"  Available cameras: {self.camera_keys}")
+    
+    def stop(self):
+        """停止视频流服务器"""
+        self.running = False
+
+
 class Gr00tRobotInferenceClient:
     """使用的确切键在modality.json中定义
 
@@ -321,6 +470,9 @@ class Gr00tRobotInferenceClient:
         obs_dict = {}
         for key in self.camera_keys:
             img = observation_dict[key]
+            # 将BGR转换为RGB（策略模型期望RGB格式）
+            if len(img.shape) == 3 and img.shape[2] == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             # 在发送到服务器之前将图像调整为224x224
             if img.shape[:2] != (224, 224):
                 img = cv2.resize(img, (224, 224), interpolation=cv2.INTER_LINEAR)
@@ -436,14 +588,16 @@ class EvalConfig:
     policy_host: str = "localhost"  # gr00t服务器的主机地址
     policy_port: int = 5555  # gr00t服务器的端口
     # todo：：调整动作块的长度
-    action_horizon: int = 40# 从动作块中执行的动作数量
+    action_horizon: int = 12# 从动作块中执行的动作数量
     lang_instruction: str = "Grab pens and place into pen holder."
     play_sounds: bool = False  # 是否播放声音
     timeout: int = 60  # 超时时间（秒）
     show_images: bool = False  # 是否显示图像
     use_sync: bool = False  # 是否使用同步版本（默认使用异步优化版本）
+    enable_video_stream: bool = True  # 是否启用视频流服务器
+    video_stream_port: int = 5000  # 视频流服务器端口
 
-    ctrl_period: float = 0.003 - 0.002  # 控制周期，单位为秒 0.001s=1000Hz
+    ctrl_period: float =0.001  # 控制周期，单位为秒 0.001s=1000Hz
     
     # 平滑算法配置 
     smoothing_method: str = "savgol"  # 平滑方法: 'ema', 'moving_avg', 'savgol', 'dct'
@@ -521,12 +675,23 @@ async def eval_async(cfg: EvalConfig):
     # 步骤3：创建线程锁保护机器人串口访问
     robot_lock = threading.Lock()
     
-    # 步骤4：初始化观测预取器
+    # 步骤4：初始化视频流服务器（如果启用）
+    video_stream_server = None
+    if cfg.enable_video_stream:
+        video_stream_server = VideoStreamServer(
+            robot=robot,
+            robot_lock=robot_lock,
+            camera_keys=camera_keys,
+            port=cfg.video_stream_port
+        )
+        video_stream_server.start()
+    
+    # 步骤5：初始化观测预取器
     executor = ThreadPoolExecutor(max_workers=4)
     obs_prefetcher = ObservationPrefetcher(robot, executor, robot_lock)
     await obs_prefetcher.start()
     
-    # 步骤5：初始化平滑器和插值器
+    # 步骤6：初始化平滑器和插值器
     action_smoother = ActionSmoother(
         robot_state_keys,
         window_size=cfg.smoothing_window_size,
@@ -703,6 +868,8 @@ async def eval_async(cfg: EvalConfig):
             # ------------------------------------
     finally:
         # 清理资源
+        if video_stream_server:
+            video_stream_server.stop()
         await obs_prefetcher.close()
         executor.shutdown(wait=True)
 
