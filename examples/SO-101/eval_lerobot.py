@@ -86,11 +86,12 @@ from gr00t.eval.service import ExternalRobotInferenceClient
 class ActionSmoother:
     """高级动作平滑器 - 使用多种平滑算法减少抖动"""
     
-    def __init__(self, robot_state_keys, window_size=5, method='ema', dct_keep_ratio=0.5):
+    def __init__(self, robot_state_keys, window_size=5, method='ema', dct_keep_ratio=0.5, savgol_window_length=5):
         self.robot_state_keys = robot_state_keys
         self.window_size = window_size
         self.method = method
         self.dct_keep_ratio = dct_keep_ratio
+        self.savgol_window_length = savgol_window_length
         self.history = {key: [] for key in robot_state_keys}
         self.current_action = None
         
@@ -159,7 +160,13 @@ class ActionSmoother:
         if len(self.history[key]) < 3:
             return np.mean(self.history[key])
         
-        return savgol_filter(self.history[key], window_length=min(len(self.history[key]), 5), polyorder=2)[-1]
+        actual_window = min(len(self.history[key]), self.savgol_window_length)
+        if actual_window < 3:
+            actual_window = 3
+        if actual_window % 2 == 0:
+            actual_window -= 1
+        
+        return savgol_filter(self.history[key], window_length=actual_window, polyorder=2)[-1]
     
     def _dct_smooth(self, new_value, key):
         """DCT（离散余弦变换）平滑 - 去除高频噪声"""
@@ -828,7 +835,8 @@ class EvalConfig:
     
     # 平滑算法配置 
     smoothing_method: str = "savgol"  # 平滑方法: 'ema', 'moving_avg', 'savgol', 'dct'
-    smoothing_window_size: int = 10 # 平滑窗口大小
+    smoothing_window_size: int = 10  # 平滑窗口大小
+    savgol_window_length: int = 7  # Savitzky-Golay滤波窗口长度（必须为奇数且>=3）
     enable_interpolation: bool = True  # 是否启用动作块内插值
     interpolation_steps: int = 10 # 每个动作之间的插值步数
     
@@ -940,7 +948,8 @@ async def eval_async(cfg: EvalConfig):
         robot_state_keys,
         window_size=cfg.smoothing_window_size,
         method=cfg.smoothing_method,
-        dct_keep_ratio=cfg.dct_keep_ratio
+        dct_keep_ratio=cfg.dct_keep_ratio,
+        savgol_window_length=cfg.savgol_window_length
     )
     action_interpolator = ActionInterpolator(
         robot_state_keys,
@@ -976,7 +985,8 @@ async def eval_async(cfg: EvalConfig):
         robot_state_keys,
         window_size=cfg.smoothing_window_size,
         method=cfg.smoothing_method,
-        dct_keep_ratio=cfg.dct_keep_ratio
+        dct_keep_ratio=cfg.dct_keep_ratio,
+        savgol_window_length=cfg.savgol_window_length
     )
     action_interpolator = ActionInterpolator(
         robot_state_keys,
@@ -1301,7 +1311,8 @@ def eval_sync(cfg: EvalConfig):
     action_smoother = ActionSmoother(
         robot_state_keys,
         window_size=cfg.smoothing_window_size,
-        method=cfg.smoothing_method
+        method=cfg.smoothing_method,
+        savgol_window_length=cfg.savgol_window_length
     )
     action_interpolator = ActionInterpolator(
         robot_state_keys,
