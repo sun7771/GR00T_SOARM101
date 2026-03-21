@@ -224,27 +224,53 @@ class ActionInterpolator:
 
 
 class ObservationPrefetcher:
-    """观测数据预取器 - 在后台异步获取观测数据"""
+    """观测数据预取器 - 环形缓存区异步预取"""
     
-    def __init__(self, robot, executor, robot_lock):
+    def __init__(self, robot, executor, robot_lock, buffer_size=4):
         self.robot = robot
         self.executor = executor
         self.robot_lock = robot_lock
-        self.current_obs = None
-        self.prefetch_task = None
         self.loop = None
+        
+        # 环形缓存区
+        self.buffer_size = buffer_size
+        self.buffer = [None] * buffer_size
+        self.read_index = 0
+        self.write_index = 0
+        self.buffer_count = 0
+        
+        # 预取任务
+        self.prefetch_tasks = []
+        self.max_prefetch = 2
+        
+        # 统计信息
+        self.hit_count = 0
+        self.miss_count = 0
+        self.prefetch_count = 0
         
     async def start(self):
         """启动预取器"""
         self.loop = asyncio.get_event_loop()
-        await self._prefetch_next()
+        await self._prefetch_multiple(self.buffer_size - 1)
         
     async def _prefetch_next(self):
         """在后台预取下一个观测数据"""
-        if self.prefetch_task and not self.prefetch_task.done():
+        if self.buffer_count >= self.buffer_size:
             return
             
-        self.prefetch_task = asyncio.create_task(self._get_observation_async())
+        active_tasks = [t for t in self.prefetch_tasks if not t.done()]
+        if len(active_tasks) >= self.max_prefetch:
+            return
+            
+        task = asyncio.create_task(self._get_observation_async())
+        self.prefetch_tasks.append(task)
+        self.prefetch_count += 1
+        
+    async def _prefetch_multiple(self, count):
+        """预取多个观测数据"""
+        for _ in range(count):
+            await self._prefetch_next()
+            await asyncio.sleep(0.001)
         
     async def _get_observation_async(self):
         """异步获取观测数据（使用线程锁保护串口访问）"""
@@ -254,31 +280,209 @@ class ObservationPrefetcher:
             with self.robot_lock:
                 return self.robot.get_observation()
         
-        return await loop.run_in_executor(
+        obs = await loop.run_in_executor(
             self.executor,
             get_observation_with_lock
         )
+        
+        self.buffer[self.write_index] = obs
+        self.write_index = (self.write_index + 1) % self.buffer_size
+        self.buffer_count = min(self.buffer_count + 1, self.buffer_size)
+        
+        return obs
     
     async def get_observation(self):
-        """获取当前观测数据，并立即启动下一次预取"""
-        if self.current_obs is None:
-            self.current_obs = await self._get_observation_async()
-            
-        obs = self.current_obs
+        """获取当前观测数据，使用环形缓存区"""
+        if self.buffer_count == 0:
+            self.miss_count += 1
+            if self.prefetch_tasks:
+                for task in self.prefetch_tasks:
+                    if not task.done():
+                        await task
+                        break
+            else:
+                await self._get_observation_async()
+        else:
+            self.hit_count += 1
         
-        # 立即启动下一次预取
+        obs = self.buffer[self.read_index]
+        self.read_index = (self.read_index + 1) % self.buffer_size
+        self.buffer_count = max(self.buffer_count - 1, 0)
+        
         await self._prefetch_next()
         
-        # 等待预取完成
-        if self.prefetch_task:
-            self.current_obs = await self.prefetch_task
-            
         return obs
+    
+    def get_cache_stats(self):
+        """获取缓存统计信息"""
+        total = self.hit_count + self.miss_count
+        hit_rate = self.hit_count / total if total > 0 else 0
+        buffer_utilization = self.buffer_count / self.buffer_size if self.buffer_size > 0 else 0
+        return {
+            'hit_count': self.hit_count,
+            'miss_count': self.miss_count,
+            'hit_rate': hit_rate,
+            'total': total,
+            'buffer_count': self.buffer_count,
+            'buffer_utilization': buffer_utilization,
+            'prefetch_count': self.prefetch_count
+        }
     
     async def close(self):
         """关闭预取器"""
-        if self.prefetch_task and not self.prefetch_task.done():
-            self.prefetch_task.cancel()
+        for task in self.prefetch_tasks:
+            if not task.done():
+                task.cancel()
+        
+        stats = self.get_cache_stats()
+        print(f"\n环形缓存区统计:")
+        print(f"  命中次数: {stats['hit_count']}")
+        print(f"  未命中次数: {stats['miss_count']}")
+        print(f"  命中率: {stats['hit_rate']*100:.2f}%")
+        print(f"  缓存区大小: {self.buffer_size}")
+        print(f"  当前缓存数: {stats['buffer_count']}")
+        print(f"  缓存利用率: {stats['buffer_utilization']*100:.2f}%")
+        print(f"  总预取次数: {stats['prefetch_count']}")
+
+
+class AdaptiveOptimizer:
+    """动态优化器 - 根据实时性能自动调整参数"""
+    
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.enabled = cfg.enable_adaptive
+        self.interval = cfg.adaptive_interval
+        self.loop_count = 0
+        
+        # 当前参数
+        self.interpolation_steps = cfg.interpolation_steps
+        self.ctrl_period = cfg.ctrl_period
+        
+        # 性能历史
+        self.utilization_history = []
+        self.loop_fps_history = []
+        self.policy_time_history = []
+        
+        # 调整统计
+        self.adjustment_count = 0
+        self.interpolation_adjustments = 0
+        self.ctrl_period_adjustments = 0
+        
+    def should_adjust(self):
+        """检查是否需要调整参数"""
+        if not self.enabled:
+            return False
+        return self.loop_count % self.interval == 0
+    
+    def adjust(self, action_chunk_utilization, loop_fps, policy_time):
+        """根据性能调整参数"""
+        if not self.should_adjust():
+            return False
+        
+        self.loop_count += 1
+        
+        # 记录历史数据
+        self.utilization_history.append(action_chunk_utilization)
+        self.loop_fps_history.append(loop_fps)
+        self.policy_time_history.append(policy_time)
+        
+        # 只保留最近50次数据
+        if len(self.utilization_history) > 50:
+            self.utilization_history.pop(0)
+            self.loop_fps_history.pop(0)
+            self.policy_time_history.pop(0)
+        
+        # 计算平均值
+        avg_utilization = np.mean(self.utilization_history[-10:])
+        avg_loop_fps = np.mean(self.loop_fps_history[-10:])
+        avg_policy_time = np.mean(self.policy_time_history[-10:])
+        
+        # 调整策略
+        adjustments = []
+        
+        # 1. 根据动作块利用率调整插值步数
+        if avg_utilization < self.cfg.target_utilization * 0.8:
+            # 利用率过低，减少插值
+            if self.interpolation_steps > self.cfg.min_interpolation_steps:
+                old_value = self.interpolation_steps
+                self.interpolation_steps = max(self.interpolation_steps - 1, self.cfg.min_interpolation_steps)
+                if old_value != self.interpolation_steps:
+                    adjustments.append(f"interpolation_steps: {old_value} → {self.interpolation_steps}")
+                    self.interpolation_adjustments += 1
+        elif avg_utilization > self.cfg.target_utilization * 1.5:
+            # 利用率过高，增加插值
+            if self.interpolation_steps < self.cfg.max_interpolation_steps:
+                old_value = self.interpolation_steps
+                self.interpolation_steps = min(self.interpolation_steps + 1, self.cfg.max_interpolation_steps)
+                if old_value != self.interpolation_steps:
+                    adjustments.append(f"interpolation_steps: {old_value} → {self.interpolation_steps}")
+                    self.interpolation_adjustments += 1
+        
+        # 2. 根据循环频率调整控制周期
+        if avg_loop_fps < 0.5 and self.ctrl_period > self.cfg.min_ctrl_period:
+            # 循环频率过低，提高控制频率
+            old_value = self.ctrl_period
+            self.ctrl_period = max(self.ctrl_period * 0.8, self.cfg.min_ctrl_period)
+            if old_value != self.ctrl_period:
+                adjustments.append(f"ctrl_period: {old_value*1000:.3f}ms → {self.ctrl_period*1000:.3f}ms")
+                self.ctrl_period_adjustments += 1
+        elif avg_loop_fps > 1.5 and self.ctrl_period < self.cfg.max_ctrl_period:
+            # 循环频率过高，降低控制频率
+            old_value = self.ctrl_period
+            self.ctrl_period = min(self.ctrl_period * 1.2, self.cfg.max_ctrl_period)
+            if old_value != self.ctrl_period:
+                adjustments.append(f"ctrl_period: {old_value*1000:.3f}ms → {self.ctrl_period*1000:.3f}ms")
+                self.ctrl_period_adjustments += 1
+        
+        # 记录调整
+        if adjustments:
+            self.adjustment_count += 1
+            print(f"\n{'='*60}")
+            print(f"[动态调整 #{self.adjustment_count}] 参数优化")
+            print(f"{'='*60}")
+            print(f"当前性能: 利用率={avg_utilization:.1f}%, 频率={avg_loop_fps:.2f}Hz, 推理={avg_policy_time:.1f}ms")
+            print(f"调整内容:")
+            for adj in adjustments:
+                print(f"  • {adj}")
+            print(f"{'='*60}")
+        
+        return len(adjustments) > 0
+    
+    def get_stats(self):
+        """获取优化统计"""
+        avg_utilization = np.mean(self.utilization_history) if self.utilization_history else 0
+        avg_loop_fps = np.mean(self.loop_fps_history) if self.loop_fps_history else 0
+        avg_policy_time = np.mean(self.policy_time_history) if self.policy_time_history else 0
+        
+        return {
+            'enabled': self.enabled,
+            'loop_count': self.loop_count,
+            'adjustment_count': self.adjustment_count,
+            'interpolation_adjustments': self.interpolation_adjustments,
+            'ctrl_period_adjustments': self.ctrl_period_adjustments,
+            'avg_utilization': avg_utilization,
+            'avg_loop_fps': avg_loop_fps,
+            'avg_policy_time': avg_policy_time,
+            'current_interpolation_steps': self.interpolation_steps,
+            'current_ctrl_period': self.ctrl_period
+        }
+    
+    def print_stats(self):
+        """打印优化统计"""
+        stats = self.get_stats()
+        print(f"\n动态优化统计:")
+        print(f"  状态: {'启用' if stats['enabled'] else '禁用'}")
+        print(f"  循环次数: {stats['loop_count']}")
+        print(f"  调整次数: {stats['adjustment_count']}")
+        print(f"  插值调整: {stats['interpolation_adjustments']}次")
+        print(f"  周期调整: {stats['ctrl_period_adjustments']}次")
+        print(f"\n当前参数:")
+        print(f"  interpolation_steps: {stats['current_interpolation_steps']}")
+        print(f"  ctrl_period: {stats['current_ctrl_period']*1000:.3f}ms ({1/stats['current_ctrl_period']:.0f}Hz)")
+        print(f"\n平均性能:")
+        print(f"  利用率: {stats['avg_utilization']:.1f}%")
+        print(f"  频率: {stats['avg_loop_fps']:.2f}Hz")
+        print(f"  推理: {stats['avg_policy_time']:.1f}ms")
 
 
 class VideoStreamServer:
@@ -609,7 +813,7 @@ class EvalConfig:
     play_sounds: bool = False  # 是否播放声音
     timeout: int = 60  # 超时时间（秒）
     show_images: bool = False  # 是否显示图像
-    use_sync: bool = False  # 是否使用同步版本（默认使用异步优化版本）
+    use_sync: bool = True  # 是否使用同步版本（默认使用异步优化版本）
     enable_video_stream: bool = True  # 是否启用视频流服务器
     video_stream_port: int = 5000  # 视频流服务器端口
 
@@ -636,6 +840,15 @@ class EvalConfig:
     wrist_flex_alpha: float = 0.15      # 腕部弯曲 - 精细动作，少一些平滑
     wrist_roll_alpha: float = 0.15     # 腕部旋转 - 快速响应
     gripper_alpha: float = 0.2         # 夹爪 - 需要更多平滑避免抖动
+    
+    # 动态调整配置
+    enable_adaptive: bool = True  # 是否启用动态调整
+    adaptive_interval: int = 10  # 动态调整间隔（循环次数）
+    min_interpolation_steps: int = 2  # 最小插值步数
+    max_interpolation_steps: int = 15  # 最大插值步数
+    min_ctrl_period: float = 0.0005  # 最小控制周期（2000Hz）
+    max_ctrl_period: float = 0.005  # 最大控制周期（200Hz）
+    target_utilization: float = 0.4  # 目标动作块利用率（40%）
 
 
 def rad_speed_limit(target_pos, current_pos, max_delta_pos=0.5):
@@ -763,6 +976,18 @@ async def eval_async(cfg: EvalConfig):
     print(f"  最大角度变化: {cfg.max_delta_pos} rad")
     if cfg.smoothing_method == 'dct':
         print(f"  DCT保留低频比例: {cfg.dct_keep_ratio}")
+    
+    # 步骤7：初始化动态优化器
+    adaptive_optimizer = AdaptiveOptimizer(cfg)
+    if adaptive_optimizer.enabled:
+        print(f"\n动态优化配置:")
+        print(f"  状态: 启用")
+        print(f"  调整间隔: {adaptive_optimizer.interval}次循环")
+        print(f"  目标利用率: {cfg.target_utilization*100:.0f}%")
+        print(f"  interpolation_steps范围: {cfg.min_interpolation_steps}-{cfg.max_interpolation_steps}")
+        print(f"  ctrl_period范围: {cfg.min_ctrl_period*1000:.3f}ms-{cfg.max_ctrl_period*1000:.3f}ms")
+    else:
+        print(f"\n动态优化: 禁用")
 
     # --- 频率和延迟统计变量初始化 ---
     last_loop_time = time.time()
@@ -893,6 +1118,18 @@ async def eval_async(cfg: EvalConfig):
                 print(f"异步获取观测耗时: {avg_obs_time:.2f} ms (平均)")
                 print(f"异步策略推理耗时: {avg_policy_time:.2f} ms (平均)")
                 print(f"总循环耗时: {dt*1000:.2f} ms")
+                
+                # 获取缓存统计
+                cache_stats = obs_prefetcher.get_cache_stats()
+                print(f"\n环形缓存区统计:")
+                print(f"  命中次数: {cache_stats['hit_count']}")
+                print(f"  未命中次数: {cache_stats['miss_count']}")
+                print(f"  命中率: {cache_stats['hit_rate']*100:.2f}%")
+                print(f"  缓存区大小: {obs_prefetcher.buffer_size}")
+                print(f"  当前缓存数: {cache_stats['buffer_count']}")
+                print(f"  缓存利用率: {cache_stats['buffer_utilization']*100:.2f}%")
+                print(f"  总预取次数: {cache_stats['prefetch_count']}")
+                
                 print(f"\n动作块利用统计:")
                 print(f"  动作块长度: {cfg.action_horizon} | 插值后: {actual_action_count}")
                 print(f"  动作执行时间: {action_execution_time*1000:.2f} ms")
@@ -910,6 +1147,21 @@ async def eval_async(cfg: EvalConfig):
                 print(f"  最大延迟: {max_latency:.2f} ms")
                 print(f"{'='*60}")
                 last_loop_time = current_time
+            
+            # 动态优化：根据性能调整参数
+            if adaptive_optimizer.enabled:
+                adjusted = adaptive_optimizer.adjust(
+                    action_chunk_utilization=action_chunk_utilization,
+                    loop_fps=loop_fps,
+                    policy_time=policy_time
+                )
+                
+                if adjusted:
+                    # 更新插值器配置
+                    action_interpolator.interpolation_steps = adaptive_optimizer.interpolation_steps
+                    # 更新控制周期
+                    cfg.ctrl_period = adaptive_optimizer.ctrl_period
+                    # 注意：action_horizon 不需要更新，因为它只在获取动作块时使用
             # ------------------------------------
     finally:
         # 清理资源
@@ -917,6 +1169,10 @@ async def eval_async(cfg: EvalConfig):
             video_stream_server.stop()
         await obs_prefetcher.close()
         executor.shutdown(wait=True)
+        
+        # 打印动态优化统计
+        if adaptive_optimizer.enabled:
+            adaptive_optimizer.print_stats()
 
 
 @draccus.wrap()
@@ -1018,7 +1274,7 @@ def eval_sync(cfg: EvalConfig):
         
         # 获取动作块（这部分包含网络延迟）
         policy_start_time = time.time()
-        action_chunk = policy.get_action(observation_dict, language_instruction)
+        action_chunk, timing_info = policy.get_action(observation_dict, language_instruction)
         policy_time = time.time() - policy_start_time
         
         # 记录网络延迟
