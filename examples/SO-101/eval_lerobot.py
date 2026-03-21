@@ -445,6 +445,13 @@ class AdaptiveOptimizer:
             for adj in adjustments:
                 print(f"  • {adj}")
             print(f"{'='*60}")
+            
+            logging.info(f"[动态调整 #{self.adjustment_count}] 参数优化")
+            logging.info(f"当前性能: 利用率={avg_utilization:.1f}%, 频率={avg_loop_fps:.2f}Hz, 推理={avg_policy_time:.1f}ms")
+            logging.info(f"调整内容:")
+            for adj in adjustments:
+                logging.info(f"  • {adj}")
+            logging.info(f"{'='*60}")
         
         return len(adjustments) > 0
     
@@ -874,6 +881,14 @@ def rad_speed_limit(target_pos, current_pos, max_delta_pos=0.5):
 async def eval_async(cfg: EvalConfig):
     init_logging()
     logging.info(pformat(asdict(cfg)))
+    
+    # 配置日志文件输出
+    log_file = "eval_performance.log"
+    file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logging.getLogger().addHandler(file_handler)
+    logging.info(f"日志文件: {log_file}")
 
     # 步骤1：初始化机器人
     robot = make_robot_from_config(cfg.robot)
@@ -1023,9 +1038,14 @@ async def eval_async(cfg: EvalConfig):
             # 直接获取最新观测数据（不使用预取器缓存，避免动作回退）
             obs_start_time = time.time()
             loop = asyncio.get_event_loop()
+            
+            def get_observation_with_lock():
+                with robot_lock:
+                    return robot.get_observation()
+            
             observation_dict = await loop.run_in_executor(
                 executor,
-                lambda: robot.get_observation()
+                get_observation_with_lock
             )
             obs_time = time.time() - obs_start_time
             async_obs_time_list.append(obs_time)
@@ -1123,6 +1143,12 @@ async def eval_async(cfg: EvalConfig):
                 print(f"异步策略推理耗时: {avg_policy_time:.2f} ms (平均)")
                 print(f"总循环耗时: {dt*1000:.2f} ms")
                 
+                logging.info(f"[Loop {loop_count}] 异步性能统计")
+                logging.info(f"周期频率: {loop_fps:.2f} Hz | 实际指令频率: {total_action_fps:.2f} Hz")
+                logging.info(f"异步获取观测耗时: {avg_obs_time:.2f} ms (平均)")
+                logging.info(f"异步策略推理耗时: {avg_policy_time:.2f} ms (平均)")
+                logging.info(f"总循环耗时: {dt*1000:.2f} ms")
+                
                 # 获取缓存统计
                 cache_stats = obs_prefetcher.get_cache_stats()
                 print(f"\n环形缓存区统计:")
@@ -1133,6 +1159,15 @@ async def eval_async(cfg: EvalConfig):
                 print(f"  当前缓存数: {cache_stats['buffer_count']}")
                 print(f"  缓存利用率: {cache_stats['buffer_utilization']*100:.2f}%")
                 print(f"  总预取次数: {cache_stats['prefetch_count']}")
+                
+                logging.info(f"环形缓存区统计:")
+                logging.info(f"  命中次数: {cache_stats['hit_count']}")
+                logging.info(f"  未命中次数: {cache_stats['miss_count']}")
+                logging.info(f"  命中率: {cache_stats['hit_rate']*100:.2f}%")
+                logging.info(f"  缓存区大小: {obs_prefetcher.buffer_size}")
+                logging.info(f"  当前缓存数: {cache_stats['buffer_count']}")
+                logging.info(f"  缓存利用率: {cache_stats['buffer_utilization']*100:.2f}%")
+                logging.info(f"  总预取次数: {cache_stats['prefetch_count']}")
                 
                 print(f"\n动作块利用统计:")
                 print(f"  动作块长度: {cfg.action_horizon} | 插值后: {actual_action_count}")
@@ -1150,6 +1185,23 @@ async def eval_async(cfg: EvalConfig):
                 print(f"  最小延迟: {min_latency:.2f} ms")
                 print(f"  最大延迟: {max_latency:.2f} ms")
                 print(f"{'='*60}")
+                
+                logging.info(f"动作块利用统计:")
+                logging.info(f"  动作块长度: {cfg.action_horizon} | 插值后: {actual_action_count}")
+                logging.info(f"  动作执行时间: {action_execution_time*1000:.2f} ms")
+                logging.info(f"  空闲时间: {idle_time*1000:.2f} ms")
+                logging.info(f"  动作块利用率: {action_chunk_utilization:.1f}%")
+                logging.info(f"策略推理详细耗时 (最近{len(timing_stats['total'])}次):")
+                logging.info(f"  ├─ 图像预处理: {avg_preprocess:.2f} ms (BGR→RGB, resize)")
+                logging.info(f"  ├─ 数据打包: {avg_pack:.2f} ms (格式转换)")
+                logging.info(f"  ├─ 网络+推理: {avg_network:.2f} ms (传输+模型推理)")
+                logging.info(f"  ├─ 数据解析: {avg_parse:.2f} ms (结果处理)")
+                logging.info(f"  └─ 总计: {avg_total:.2f} ms")
+                logging.info(f"网络延迟统计 (最近{len(network_latency_list)}次):")
+                logging.info(f"  平均延迟: {avg_latency:.2f} ms")
+                logging.info(f"  最小延迟: {min_latency:.2f} ms")
+                logging.info(f"  最大延迟: {max_latency:.2f} ms")
+                logging.info(f"{'='*60}")
                 last_loop_time = current_time
             
             # 动态优化：根据性能调整参数
@@ -1195,6 +1247,14 @@ def eval_sync(cfg: EvalConfig):
     """原始同步版本（用于性能对比）"""
     init_logging()
     logging.info(pformat(asdict(cfg)))
+    
+    # 配置日志文件输出
+    log_file = "eval_performance_sync.log"
+    file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logging.getLogger().addHandler(file_handler)
+    logging.info(f"日志文件: {log_file}")
 
     # 步骤1：初始化机器人
     robot = make_robot_from_config(cfg.robot)
@@ -1358,6 +1418,22 @@ def eval_sync(cfg: EvalConfig):
             print(f"  最小延迟: {min_latency:.2f} ms")
             print(f"  最大延迟: {max_latency:.2f} ms")
             print(f"{'='*60}")
+            
+            logging.info(f"[Loop {loop_count}] 性能统计 (同步版本)")
+            logging.info(f"周期频率: {loop_fps:.2f} Hz | 实际指令频率: {total_action_fps:.2f} Hz")
+            logging.info(f"获取观测耗时: {obs_time*1000:.2f} ms")
+            logging.info(f"策略推理耗时: {policy_time*1000:.2f} ms")
+            logging.info(f"总循环耗时: {dt*1000:.2f} ms")
+            logging.info(f"动作块利用统计:")
+            logging.info(f"  动作块长度: {cfg.action_horizon} | 插值后: {actual_action_count}")
+            logging.info(f"  动作执行时间: {action_execution_time*1000:.2f} ms")
+            logging.info(f"  空闲时间: {idle_time*1000:.2f} ms")
+            logging.info(f"  动作块利用率: {action_chunk_utilization:.1f}%")
+            logging.info(f"网络延迟统计 (最近{len(network_latency_list)}次):")
+            logging.info(f"  平均延迟: {avg_latency:.2f} ms")
+            logging.info(f"  最小延迟: {min_latency:.2f} ms")
+            logging.info(f"  最大延迟: {max_latency:.2f} ms")
+            logging.info(f"{'='*60}")
             last_loop_time = current_time
         # ------------------------------------
 
