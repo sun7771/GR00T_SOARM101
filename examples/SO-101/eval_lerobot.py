@@ -1,92 +1,165 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """
-This is the new Gr00T policy eval script with so100, so101 robot arm. Based on:
-https://github.com/huggingface/lerobot/pull/777
+================================================================================
+GR00T 机器人策略评估脚本
+================================================================================
 
-Example command:
+本脚本用于在真实机器人上评估 NVIDIA GR00T 模型的策略推理性能。
+支持 SO-100 和 SO-101 系列机械臂，通过远程推理服务器获取动作指令。
 
-```shell
+主要功能:
+---------
+1. 机器人控制: 连接并控制 SO-100/SO-101 机械臂
+2. 策略推理: 通过网络调用远程 GR00T 模型获取动作块
+3. 动作平滑: 提供多种平滑算法(EMA/移动平均/Savitzky-Golay/DCT/卡尔曼滤波)
+4. 动作插值: 在动作块内进行插值，使运动更平滑
+5. 视频流服务: 提供 Web 界面实时查看摄像头画面
+6. 性能监控: 实时统计推理延迟、控制频率等性能指标
+7. 动态优化: 根据实时性能自动调整控制参数
 
-python eval_gr00t_so100.py \
-    --robot.type=so100_follower \
-    --robot.port=/dev/ttyACM0 \
-    --robot.id=lil_guy \
-    --robot.cameras="{ wrist: {type: opencv, index_or_path: 9, width: 640, height: 480, fps: 30}, front: {type: opencv, index_or_path: 15, width: 640, height: 480, fps: 30}}" \
-    --policy_host=10.112.209.136 \
+架构说明:
+---------
+- 异步版本(eval_async): 使用观测预取、线程池优化，推荐用于生产环境
+- 同步版本(eval_sync): 简单直接的同步调用，用于性能对比测试
+
+使用示例:
+---------
+python eval_lerobot.py \\
+    --robot.type=so101_follower \\
+    --robot.port=/dev/ttyACM0 \\
+    --robot.id=lil_guy \\
+    --robot.cameras="{ wrist: {type: opencv, index_or_path: 9}, front: {type: opencv, index_or_path: 15}}" \\
+    --policy_host=10.112.209.136 \\
     --lang_instruction="Grab markers and place into pen holder."
-```
 
+依赖项:
+-------
+- lerobot: Hugging Face 机器人控制库
+- gr00t: NVIDIA GR00T 模型推理服务
+- Flask: 视频流 Web 服务器
+- scipy: 信号处理(平滑算法)
+- numpy: 数值计算
 
-First replay to ensure the robot is working:
-```shell
-python -m lerobot.replay \
-    --robot.type=so100_follower \
-    --robot.port=/dev/ttyACM0 \
-    --robot.id=lil_guy \
-    --dataset.repo_id=youliangtan/so100-table-cleanup \
-    --dataset.episode=2
-```
+作者: Hanqin Sun
+================================================================================
 """
 
-import asyncio
-import logging
-import time
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
-from pprint import pformat
-import cv2
-import draccus
-import matplotlib.pyplot as plt
-import numpy as np
-from scipy.fftpack import dct, idct
-from scipy.signal import savgol_filter
-from flask import Flask, Response, render_template_string
-from lerobot.cameras.opencv.configuration_opencv import (  # noqa: F401
-    OpenCVCameraConfig,
+# ==================== 标准库导入 ====================
+import asyncio  # 异步编程支持,用于异步评估版本
+import logging  # 日志记录,用于记录运行信息和错误
+import time  # 时间相关功能,用于性能统计和延时控制
+import threading  # 线程支持,用于并发执行和线程锁
+from concurrent.futures import ThreadPoolExecutor  # 线程池执行器,用于异步执行阻塞操作
+from dataclasses import asdict, dataclass  # 数据类支持,用于配置类定义
+from pprint import pformat  # 格式化打印,用于美观地输出配置信息
+
+# ==================== 第三方库导入 ====================
+import cv2  # OpenCV,用于图像处理和摄像头操作
+import draccus  # 命令行参数解析库,用于配置管理
+import matplotlib.pyplot as plt  # Matplotlib,用于图像显示
+import numpy as np  # NumPy,用于数值计算和数组操作
+from scipy.fftpack import dct, idct  # 离散余弦变换,用于DCT平滑算法
+from scipy.signal import savgol_filter  # Savitzky-Golay滤波器,用于信号平滑
+from flask import Flask, Response, render_template_string  # Flask,用于视频流Web服务器
+
+# ==================== LeRobot 库导入 ====================
+
+from lerobot.cameras.opencv.configuration_opencv import (  
+    OpenCVCameraConfig,  # OpenCV摄像头配置类
 )
-from lerobot.robots import (  # noqa: F401
-    Robot,
-    RobotConfig,
-    koch_follower,
-    make_robot_from_config,
-    so101_follower
+from lerobot.robots import (  
+    Robot,  # 机器人基类
+    RobotConfig,  # 机器人配置基类
+    koch_follower,  # Koch机器人配置
+    make_robot_from_config,  # 从配置创建机器人的工厂函数
+    so101_follower  # SO-101机器人配置
 )
 from lerobot.utils.utils import (
-    init_logging,
-    log_say,
+    init_logging,  # 初始化日志系统
+    log_say,  # 日志并语音播报
 )
 
-# NOTE:
-# Sometimes we would like to abstract different env, or run this on a separate machine
-# User can just move this single python class method gr00t/eval/service.py
-# to their code or do the following line below
-# sys.path.append(os.path.expanduser("~/Isaac-GR00T/gr00t/eval/"))
-# from service import ExternalRobotInferenceClient
+# ==================== GR00T 模型服务导入 ====================
+from gr00t.eval.service import ExternalRobotInferenceClient  # GR00T外部推理客户端
 
-from gr00t.eval.service import ExternalRobotInferenceClient
 
 #################################################################################
 
 
 class ActionSmoother:
-    """高级动作平滑器 - 使用多种平滑算法减少抖动"""
+    """
+    高级动作平滑器 - 使用多种平滑算法减少机器人动作抖动
+    
+    该类实现了多种平滑算法，用于处理策略模型输出的动作指令，
+    减少因模型输出不稳定或网络延迟导致的机器人动作抖动。
+    
+    支持的平滑算法:
+    ---------------
+    - ema: 指数移动平均 (Exponential Moving Average)
+           计算公式: smoothed = alpha * new_value + (1 - alpha) * prev_value
+           特点: 响应快，适合快速变化的动作
+           
+    - moving_avg: 简单移动平均 (Simple Moving Average)
+                  计算公式: smoothed = mean(history)
+                  特点: 平滑效果好，但延迟较大
+                  
+    - savgol: Savitzky-Golay 滤波器
+              基于多项式拟合的平滑方法
+              特点: 保持信号形状的同时平滑噪声
+              
+    - dct: 离散余弦变换平滑
+           通过DCT变换去除高频噪声
+           特点: 适合处理周期性信号
+           
+    - kalman: 卡尔曼滤波
+              基于状态估计的最优滤波器
+              特点: 适合处理带噪声的观测值，可调节过程噪声和测量噪声
+    
+    使用示例:
+    ---------
+    >>> smoother = ActionSmoother(
+    ...     robot_state_keys=['shoulder_pan.pos', 'gripper.pos'],
+    ...     window_size=10,
+    ...     method='savgol'
+    ... )
+    >>> smoothed = smoother.smooth(action_dict, joint_alpha_map)
+    
+    属性:
+    -----
+    robot_state_keys : list
+        机器人状态键名列表，如 ['shoulder_pan.pos', 'gripper.pos']
+    window_size : int
+        历史数据窗口大小，用于移动平均等算法
+    method : str
+        平滑算法名称 ('ema', 'moving_avg', 'savgol', 'dct', 'kalman')
+    history : dict
+        各关节的历史值存储
+    """
     
     def __init__(self, robot_state_keys, window_size=5, method='ema', dct_keep_ratio=0.5, savgol_window_length=5, kalman_process_noise=0.01, kalman_measurement_noise=0.1):
+        """
+        初始化动作平滑器
+        
+        参数:
+        -----
+        robot_state_keys : list
+            机器人状态键名列表，对应各关节名称
+            例如: ['shoulder_pan.pos', 'shoulder_lift.pos', 'elbow_flex.pos', 
+                   'wrist_flex.pos', 'wrist_roll.pos', 'gripper.pos']
+        window_size : int, 默认=5
+            历史数据窗口大小，影响平滑程度
+            值越大平滑效果越强，但延迟也越大
+        method : str, 默认='ema'
+            平滑算法选择: 'ema', 'moving_avg', 'savgol', 'dct', 'kalman'
+        dct_keep_ratio : float, 默认=0.5
+            DCT平滑时保留低频系数的比例 (0.0-1.0)
+            值越小越平滑，但可能丢失细节
+        savgol_window_length : int, 默认=5
+            Savitzky-Golay滤波窗口长度（必须为奇数且>=3）
+        kalman_process_noise : float, 默认=0.01
+            卡尔曼滤波过程噪声Q，值越大响应越快但噪声更多
+        kalman_measurement_noise : float, 默认=0.1
+            卡尔曼滤波测量噪声R，值越大平滑效果越强
+        """
         self.robot_state_keys = robot_state_keys
         self.window_size = window_size
         self.method = method
@@ -101,7 +174,22 @@ class ActionSmoother:
         self.kalman_P = {key: None for key in robot_state_keys}
         
     def smooth(self, action_dict, joint_alpha_map):
-        """应用平滑算法"""
+        """
+        对动作字典应用平滑算法
+        
+        参数:
+        -----
+        action_dict : dict
+            原始动作字典，键为关节名，值为目标位置
+        joint_alpha_map : dict
+            各关节的平滑系数映射（仅用于EMA方法）
+            键为关节名，值为alpha系数(0-1)
+            alpha越大响应越快，越小越平滑
+        
+        返回:
+        -----
+        dict : 平滑后的动作字典
+        """
         smoothed_action = {}
         
         for key in self.robot_state_keys:
@@ -141,7 +229,24 @@ class ActionSmoother:
         return smoothed_action
     
     def _ema_smooth(self, new_value, key, alpha):
-        """指数移动平均平滑"""
+        """
+        指数移动平均平滑 (Exponential Moving Average)
+        
+        公式: smoothed = alpha * new_value + (1 - alpha) * prev_value
+        
+        参数:
+        -----
+        new_value : float
+            新的动作值
+        key : str
+            关节名称
+        alpha : float
+            平滑系数 (0-1)，值越大响应越快
+        
+        返回:
+        -----
+        float : 平滑后的值
+        """
         if len(self.history[key]) == 0:
             smoothed = new_value
         else:
@@ -154,7 +259,22 @@ class ActionSmoother:
         return smoothed
     
     def _moving_avg_smooth(self, new_value, key):
-        """移动平均平滑"""
+        """
+        简单移动平均平滑 (Simple Moving Average)
+        
+        计算历史窗口内所有值的平均
+        
+        参数:
+        -----
+        new_value : float
+            新的动作值
+        key : str
+            关节名称
+        
+        返回:
+        -----
+        float : 平滑后的值（历史均值）
+        """
         self.history[key].append(new_value)
         if len(self.history[key]) > self.window_size:
             self.history[key].pop(0)
@@ -162,7 +282,22 @@ class ActionSmoother:
         return np.mean(self.history[key])
     
     def _savgol_smooth(self, new_value, key):
-        """Savitzky-Golay滤波器平滑"""
+        """
+        Savitzky-Golay 滤波器平滑
+        
+        基于多项式拟合的平滑方法，能保持信号的高频特征
+        
+        参数:
+        -----
+        new_value : float
+            新的动作值
+        key : str
+            关节名称
+        
+        返回:
+        -----
+        float : 平滑后的值
+        """
         self.history[key].append(new_value)
         if len(self.history[key]) > self.window_size:
             self.history[key].pop(0)
@@ -179,7 +314,30 @@ class ActionSmoother:
         return savgol_filter(self.history[key], window_length=actual_window, polyorder=2)[-1]
     
     def _dct_smooth(self, new_value, key):
-        """DCT（离散余弦变换）平滑 - 去除高频噪声"""
+        """
+        DCT（离散余弦变换）平滑 - 去除高频噪声
+        
+        通过离散余弦变换将信号转换到频域，保留低频成分，
+        去除高频噪声后逆变换回时域。
+        
+        参数:
+        -----
+        new_value : float
+            新的动作值
+        key : str
+            关节名称
+        
+        返回:
+        -----
+        float : 平滑后的值
+        
+        原理:
+        -----
+        1. 对历史数据进行DCT-II变换
+        2. 保留前keep_ratio比例的低频系数
+        3. 高频系数置零（去除噪声）
+        4. 逆DCT变换得到平滑信号
+        """
         self.history[key].append(new_value)
         if len(self.history[key]) > self.window_size:
             self.history[key].pop(0)
@@ -187,24 +345,47 @@ class ActionSmoother:
         if len(self.history[key]) < 3:
             return np.mean(self.history[key])
         
-        # 对历史数据进行DCT变换
         signal = np.array(self.history[key])
         dct_coeffs = dct(signal, type=2, norm='ortho')
         
-        # 保留低频系数，去除高频噪声
-        # 使用配置的保留比例
         keep_ratio = self.dct_keep_ratio
         keep_count = max(1, int(len(dct_coeffs) * keep_ratio))
         dct_coeffs_filtered = dct_coeffs.copy()
         dct_coeffs_filtered[keep_count:] = 0
         
-        # 逆DCT变换得到平滑信号
         smoothed_signal = idct(dct_coeffs_filtered, type=2, norm='ortho')
         
         return smoothed_signal[-1]
     
     def _kalman_smooth(self, new_value, key):
-        """卡尔曼滤波平滑 - 状态估计滤波器，适合处理带噪声的观测值"""
+        """
+        卡尔曼滤波平滑 - 状态估计滤波器
+        
+        卡尔曼滤波是一种最优递归滤波器，适合处理带噪声的观测值。
+        通过预测-更新循环估计真实状态。
+        
+        参数:
+        -----
+        new_value : float
+            新的观测值（动作值）
+        key : str
+            关节名称
+        
+        返回:
+        -----
+        float : 状态估计值（平滑后的值）
+        
+        算法步骤:
+        ---------
+        1. 预测: x_pred = x_prev, P_pred = P_prev + Q
+        2. 计算卡尔曼增益: K = P_pred / (P_pred + R)
+        3. 更新: x = x_pred + K * (z - x_pred), P = (1 - K) * P_pred
+        
+        其中:
+        - Q: 过程噪声协方差，越大响应越快
+        - R: 测量噪声协方差，越大平滑效果越强
+        - K: 卡尔曼增益
+        """
         Q = self.kalman_process_noise
         R = self.kalman_measurement_noise
         
@@ -229,14 +410,61 @@ class ActionSmoother:
 
 
 class ActionInterpolator:
-    """动作插值器 - 在动作块内进行平滑插值"""
+    """
+    动作插值器 - 在动作块内进行平滑插值
+    
+    该类用于在策略模型输出的动作块之间进行线性插值，
+    使机器人运动更加平滑连续，避免动作之间的突变。
+    
+    原理说明:
+    ---------
+    策略模型通常输出一个动作块（action chunk），包含多个时间步的动作。
+    如果直接执行这些动作，可能会在动作之间产生跳变。
+    通过插值，在每个动作之间插入中间帧，使运动更平滑。
+    
+    使用示例:
+    ---------
+    >>> interpolator = ActionInterpolator(robot_state_keys, interpolation_steps=5)
+    >>> interpolated_chunk = interpolator.interpolate_action_chunk(action_chunk)
+    """
     
     def __init__(self, robot_state_keys, interpolation_steps=3):
+        """
+        初始化动作插值器
+        
+        参数:
+        -----
+        robot_state_keys : list
+            机器人状态键名列表
+        interpolation_steps : int, 默认=3
+            每两个动作之间的插值步数
+            值越大运动越平滑，但执行时间越长
+        """
         self.robot_state_keys = robot_state_keys
         self.interpolation_steps = interpolation_steps
         
     def interpolate_action_chunk(self, action_chunk):
-        """对动作块进行插值，使过渡更平滑"""
+        """
+        对动作块进行线性插值
+        
+        在动作块中每两个相邻动作之间插入中间帧，
+        使用线性插值计算中间值。
+        
+        参数:
+        -----
+        action_chunk : list[dict]
+            原始动作块，每个元素是一个动作字典
+        
+        返回:
+        -----
+        list[dict] : 插值后的动作块
+        
+        示例:
+        -----
+        原始动作块: [A, B, C] (长度3)
+        插值步数: 2
+        插值后: [A, A->B_1, A->B_2, B, B->C_1, B->C_2, C] (长度7)
+        """
         if len(action_chunk) <= 1:
             return action_chunk
         
@@ -265,37 +493,83 @@ class ActionInterpolator:
 
 
 class ObservationPrefetcher:
-    """观测数据预取器 - 环形缓存区异步预取"""
+    """
+    观测数据预取器 - 环形缓存区异步预取
+    
+    该类实现了一个异步观测数据预取机制，使用环形缓存区存储预取的数据。
+    通过在后台异步获取观测数据，减少主循环的等待时间，提高整体控制频率。
+    
+    工作原理:
+    ---------
+    1. 使用环形缓存区（circular buffer）存储预取的观测数据
+    2. 后台线程异步调用 robot.get_observation() 获取数据
+    3. 主循环直接从缓存读取，无需等待
+    4. 使用线程锁保护机器人串口访问，避免冲突
+    
+    性能优势:
+    ---------
+    - 减少主循环阻塞时间
+    - 提高控制频率
+    - 平滑网络延迟影响
+    
+    属性:
+    -----
+    buffer_size : int
+        环形缓存区大小
+    hit_count : int
+        缓存命中次数
+    miss_count : int
+        缓存未命中次数
+    """
     
     def __init__(self, robot, executor, robot_lock, buffer_size=4):
+        """
+        初始化观测数据预取器
+        
+        参数:
+        -----
+        robot : Robot
+            机器人实例，用于获取观测数据
+        executor : ThreadPoolExecutor
+            线程池执行器，用于异步执行
+        robot_lock : threading.Lock
+            机器人访问锁，保护串口访问
+        buffer_size : int, 默认=4
+            环形缓存区大小
+        """
         self.robot = robot
         self.executor = executor
         self.robot_lock = robot_lock
         self.loop = None
         
-        # 环形缓存区
         self.buffer_size = buffer_size
         self.buffer = [None] * buffer_size
         self.read_index = 0
         self.write_index = 0
         self.buffer_count = 0
         
-        # 预取任务
         self.prefetch_tasks = []
         self.max_prefetch = 2
         
-        # 统计信息
         self.hit_count = 0
         self.miss_count = 0
         self.prefetch_count = 0
         
     async def start(self):
-        """启动预取器"""
+        """
+        启动预取器
+        
+        初始化事件循环并预填充缓存区
+        """
         self.loop = asyncio.get_event_loop()
         await self._prefetch_multiple(self.buffer_size - 1)
         
     async def _prefetch_next(self):
-        """在后台预取下一个观测数据"""
+        """
+        在后台预取下一个观测数据
+        
+        检查缓存区状态和活动任务数，决定是否启动新的预取任务
+        """
         if self.buffer_count >= self.buffer_size:
             return
             
@@ -308,13 +582,29 @@ class ObservationPrefetcher:
         self.prefetch_count += 1
         
     async def _prefetch_multiple(self, count):
-        """预取多个观测数据"""
+        """
+        预取多个观测数据
+        
+        参数:
+        -----
+        count : int
+            要预取的数据数量
+        """
         for _ in range(count):
             await self._prefetch_next()
             await asyncio.sleep(0.001)
         
     async def _get_observation_async(self):
-        """异步获取观测数据（使用线程锁保护串口访问）"""
+        """
+        异步获取观测数据
+        
+        使用线程池执行器在后台调用 robot.get_observation()，
+        并使用线程锁保护串口访问。
+        
+        返回:
+        -----
+        dict : 观测数据字典
+        """
         loop = asyncio.get_event_loop()
         
         def get_observation_with_lock():
@@ -333,7 +623,16 @@ class ObservationPrefetcher:
         return obs
     
     async def get_observation(self):
-        """获取当前观测数据，使用环形缓存区"""
+        """
+        获取当前观测数据
+        
+        从环形缓存区读取数据，如果缓存为空则等待预取完成。
+        读取后会触发新的预取任务。
+        
+        返回:
+        -----
+        dict : 观测数据字典
+        """
         if self.buffer_count == 0:
             self.miss_count += 1
             if self.prefetch_tasks:
@@ -355,7 +654,13 @@ class ObservationPrefetcher:
         return obs
     
     def get_cache_stats(self):
-        """获取缓存统计信息"""
+        """
+        获取缓存统计信息
+        
+        返回:
+        -----
+        dict : 包含命中率、缓存利用率等统计信息
+        """
         total = self.hit_count + self.miss_count
         hit_rate = self.hit_count / total if total > 0 else 0
         buffer_utilization = self.buffer_count / self.buffer_size if self.buffer_size > 0 else 0
@@ -370,7 +675,11 @@ class ObservationPrefetcher:
         }
     
     async def close(self):
-        """关闭预取器"""
+        """
+        关闭预取器
+        
+        取消所有未完成的预取任务并打印统计信息
+        """
         for task in self.prefetch_tasks:
             if not task.done():
                 task.cancel()
@@ -387,7 +696,30 @@ class ObservationPrefetcher:
 
 
 class AdaptiveOptimizer:
-    """动态优化器 - 根据实时性能自动调整参数"""
+    """
+    动态优化器 - 根据实时性能自动调整参数
+    
+    该类实现了自适应参数调整机制，根据实时性能指标（如动作块利用率、
+    循环频率、推理时间等）自动调整控制参数，以优化机器人控制性能。
+    
+    调整策略:
+    ---------
+    1. 动作块利用率过低时，减少插值步数以提高响应速度
+    2. 动作块利用率过高时，增加插值步数以提高平滑度
+    3. 循环频率过低时，减小控制周期以提高控制频率
+    4. 循环频率过高时，增大控制周期以降低CPU负载
+    
+    属性:
+    -----
+    enabled : bool
+        是否启用动态优化
+    interval : int
+        调整间隔（每多少次循环调整一次）
+    interpolation_steps : int
+        当前插值步数
+    ctrl_period : float
+        当前控制周期
+    """
     
     def __init__(self, cfg):
         self.cfg = cfg
@@ -682,12 +1014,40 @@ class VideoStreamServer:
 
 
 class Gr00tRobotInferenceClient:
-    """使用的确切键在modality.json中定义
+    """GR00T机器人推理客户端 - 连接远程GR00T策略推理服务
 
-    目前仅支持so100_follower、so101_follower
-    根据modality.json修改此代码以支持具有其他键的其他机器人
+    该类封装了与NVIDIA GR00T策略推理服务器的通信,负责:
+    1. 准备观测数据(图像和机器人状态)
+    2. 调用远程推理服务获取动作块
+    3. 解析推理结果并转换为机器人可执行的格式
+
+    支持的机器人:
+    -------------
+    目前仅支持 SO-100 和 SO-101 系列机械臂
+    如需支持其他机器人,需根据 modality.json 修改此代码
+
+    数据格式:
+    ---------
+    输入:
+    - 视频数据: 多个摄像头的图像,格式为 RGB,尺寸 224x224
+    - 机器人状态: 6个关节的位置(5个机械臂关节 + 1个夹爪)
+    - 语言指令: 自然语言任务描述
+
+    输出:
+    - 动作块: 包含多个时间步的动作序列
+    - 每个动作包含6个关节的目标位置
+
+    使用示例:
+    ---------
+    >>> client = Gr00tRobotInferenceClient(
+    ...     host="10.112.209.136",
+    ...     port=5555,
+    ...     camera_keys=['wrist', 'front'],
+    ...     robot_state_keys=['shoulder_pan.pos', 'shoulder_lift.pos', ...]
+    ... )
+    >>> action_chunk, timing = await client.get_action_async(observation_dict, "Grab the pen")
     """
-    #设置默认的 camera_keys 和 robot_state_keys
+    # 设置默认的 camera_keys 和 robot_state_keys
     def __init__(
         self,
         host="localhost",
@@ -696,6 +1056,21 @@ class Gr00tRobotInferenceClient:
         robot_state_keys=[],
         show_images=False,
     ):
+        """初始化GR00T推理客户端
+
+        参数:
+        -----
+        host : str, 默认="localhost"
+            GR00T推理服务器的主机地址
+        port : int, 默认=5555
+            GR00T推理服务器的端口号
+        camera_keys : list
+            摄像头键名列表,如 ['wrist', 'front']
+        robot_state_keys : list
+            机器人状态键名列表,必须包含6个关节
+        show_images : bool, 默认=False
+            是否显示观测图像(用于调试)
+        """
         self.policy = ExternalRobotInferenceClient(host=host, port=port)
         self.camera_keys = camera_keys
         self.robot_state_keys = robot_state_keys
@@ -707,7 +1082,23 @@ class Gr00tRobotInferenceClient:
         self.executor = ThreadPoolExecutor(max_workers=4)
 
     async def get_action_async(self, observation_dict, lang: str):
-        """异步获取动作块"""
+        """异步获取动作块
+
+        使用线程池在后台执行同步推理,避免阻塞事件循环。
+
+        参数:
+        -----
+        observation_dict : dict
+            观测数据字典,包含摄像头图像和机器人状态
+        lang : str
+            自然语言任务描述
+
+        返回:
+        -----
+        tuple : (action_chunk, timing_info)
+            action_chunk: 动作块列表,每个元素是一个动作字典
+            timing_info: 计时信息字典,包含各阶段耗时
+        """
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
             self.executor,
@@ -717,7 +1108,27 @@ class Gr00tRobotInferenceClient:
         )
 
     def _get_action_sync(self, observation_dict, lang: str):
-        """同步获取动作块（在线程池中执行）"""
+        """同步获取动作块（在线程池中执行）
+
+        这是实际执行推理的函数,包含以下步骤:
+        1. 图像预处理: BGR→RGB转换,调整尺寸到224x224
+        2. 数据打包: 将观测数据打包成GR00T期望的格式
+        3. 网络传输+推理: 发送到服务器并等待结果
+        4. 数据解析: 将服务器返回的结果转换为LeRobot格式
+
+        参数:
+        -----
+        observation_dict : dict
+            观测数据字典
+        lang : str
+            自然语言任务描述
+
+        返回:
+        -----
+        tuple : (action_chunk, timing_info)
+            action_chunk: 动作块列表
+            timing_info: 包含各阶段耗时的字典
+        """
         timing_info = {}
         
         # 步骤1：图像预处理
@@ -805,17 +1216,43 @@ class Gr00tRobotInferenceClient:
         raise TypeError(f"不支持的 action_chunk 类型: {type(action_chunk)}")
 
     def get_action(self, observation_dict, lang: str):
-        """同步获取动作块（向后兼容）"""
+        """同步获取动作块（向后兼容）
+
+        这是一个同步包装器,用于向后兼容旧的代码。
+
+        参数:
+        -----
+        observation_dict : dict
+            观测数据字典
+        lang : str
+            自然语言任务描述
+
+        返回:
+        -----
+        tuple : (action_chunk, timing_info)
+        """
         return self._get_action_sync(observation_dict, lang)
 
     def _convert_to_lerobot_action(
         self, action_chunk: dict[str, np.array], idx: int
     ) -> dict[str, float]:
-        """
-        这是一个魔法函数，将动作块转换为 dict[str, float]
+        """将动作块转换为LeRobot格式的动作字典
+
+        这是一个魔法函数,将动作块转换为 dict[str, float]
         这是因为动作块是 dict[str, np.array]
         我们想要将其转换为 dict[str, float]
         以便可以发送给机器人
+
+        参数:
+        -----
+        action_chunk : dict[str, np.array]
+            动作块字典,键为模态名,值为动作数组
+        idx : int
+            要提取的动作索引
+
+        返回:
+        -----
+        dict[str, float] : LeRobot格式的动作字典
         """
         concat_action = np.concatenate(
             [np.atleast_1d(action_chunk[f"action.{key}"][idx]) for key in self.modality_keys],
@@ -847,25 +1284,60 @@ def view_img(img, overlay_img=None):
 
 
 def print_yellow(text):
+    """以黄色文本打印信息到控制台
+
+    使用ANSI转义码将文本设置为黄色,用于在控制台中突出显示重要信息。
+
+    参数:
+    -----
+    text : str
+        要以黄色显示的文本内容
+
+    示例:
+    -----
+    >>> print_yellow("警告: 这是一个重要信息")
+    """
     print("\033[93m {}\033[00m".format(text))
 
 
 @dataclass
 class EvalConfig:
-    robot: RobotConfig  # 要使用的机器人
+    """评估配置类 - 定义机器人策略评估的所有配置参数
+
+    该数据类包含了评估脚本运行所需的所有配置参数,包括机器人配置、
+    策略服务器地址、平滑算法参数、动态优化参数等。
+
+    配置参数说明:
+    -------------
+    - robot: 机器人配置对象,指定使用的机器人类型和参数
+    - policy_host/port: GR00T策略推理服务器的地址和端口
+    - action_horizon: 动作块长度,每次推理生成的动作数量
+    - lang_instruction: 自然语言指令,描述机器人要执行的任务
+    - smoothing_method: 动作平滑算法选择
+    - interpolation_steps: 动作插值步数
+    - enable_adaptive: 是否启用动态参数优化
+
+    使用示例:
+    ---------
+    >>> cfg = EvalConfig(
+    ...     robot=so101_follower_config,
+    ...     policy_host="10.112.209.136",
+    ...     lang_instruction="Grab markers and place into pen holder."
+    ... )
+    """
+    robot: RobotConfig  # 要使用的机器人配置
     policy_host: str = "localhost"  # gr00t服务器的主机地址
     policy_port: int = 5555  # gr00t服务器的端口
-    # todo：：调整动作块的长度
-    action_horizon: int = 4# 从动作块中执行的动作数量
-    lang_instruction: str = "Grab pens and place into pen holder."
-    play_sounds: bool = False  # 是否播放声音
+    action_horizon: int = 4  # 从动作块中执行的动作数量
+    lang_instruction: str = "Grab pens and place into pen holder."  # 自然语言任务描述
+    play_sounds: bool = False  # 是否播放声音提示
     timeout: int = 60  # 超时时间（秒）
-    show_images: bool = False  # 是否显示图像
+    show_images: bool = False  # 是否显示图像预览
     use_sync: bool = False  # 是否使用同步版本（默认使用异步优化版本）
     enable_video_stream: bool = True  # 是否启用视频流服务
     video_stream_port: int = 5000  # 视频流服务器端口
 
-    ctrl_period: float =0.003  # 控制周期，单位为秒 0.003s=333Hz
+    ctrl_period: float = 0.003  # 控制周期，单位为秒 0.003s=333Hz
     
     # 平滑算法配置 
     smoothing_method: str = "savgol"  # 平滑方法: 'ema', 'moving_avg', 'savgol', 'dct', 'kalman'
@@ -905,8 +1377,40 @@ class EvalConfig:
 
 
 def rad_speed_limit(target_pos, current_pos, max_delta_pos=0.5):
+    """关节速度限制函数 - 限制关节运动的最大速度
 
-    # if delta_time is None:
+    该函数通过限制单次控制周期内的最大关节角度变化,防止机器人运动过快
+    导致的不稳定或危险情况。当目标位置与当前位置的差值超过最大允许值时,
+    会按比例缩放所有关节的运动量。
+
+    工作原理:
+    ---------
+    1. 计算目标位置与当前位置的差值 delta_pos
+    2. 计算所有关节中最大的运动幅度 max(|delta_pos|)
+    3. 如果最大运动幅度超过 max_delta_pos,计算缩放比例
+    4. 按缩放比例调整所有关节的运动量
+
+    参数:
+    -----
+    target_pos : np.ndarray or list
+        目标关节位置数组,形状为 (n_joints,)
+    current_pos : np.ndarray or list
+        当前关节位置数组,形状为 (n_joints,)
+    max_delta_pos : float, 默认=0.5
+        单次控制周期内允许的最大关节角度变化（弧度）
+
+    返回:
+    -----
+    np.ndarray : 限制后的目标位置数组
+
+    示例:
+    -----
+    >>> current = np.array([0.0, 0.0, 0.0])
+    >>> target = np.array([1.0, 0.5, 0.3])
+    >>> limited = rad_speed_limit(target, current, max_delta_pos=0.5)
+    >>> # limited 将被限制在最大变化0.5弧度以内
+    """
+
     # 计算当前位置与目标位置的差值
     delta_pos = target_pos - current_pos
 
@@ -925,6 +1429,56 @@ def rad_speed_limit(target_pos, current_pos, max_delta_pos=0.5):
 
 @draccus.wrap()
 async def eval_async(cfg: EvalConfig):
+    """异步评估主函数 - 使用异步优化策略评估机器人性能
+
+    这是评估脚本的异步版本,使用了多种优化技术提高控制频率和性能:
+    - 观测数据预取: 使用环形缓存区异步预取观测数据
+    - 线程池并发: 使用线程池执行阻塞操作
+    - 动作平滑: 多种平滑算法减少动作抖动
+    - 动作插值: 在动作块内插值使运动更平滑
+    - 动态优化: 根据实时性能自动调整参数
+    - 视频流服务: 提供Web界面实时查看摄像头画面
+
+    执行流程:
+    ---------
+    1. 初始化日志系统和配置
+    2. 连接并初始化机器人
+    3. 初始化GR00T策略推理客户端
+    4. 创建线程锁保护机器人串口访问
+    5. 启动视频流服务器(可选)
+    6. 初始化观测预取器
+    7. 初始化平滑器和插值器
+    8. 进入主控制循环:
+       - 异步获取观测数据
+       - 异步调用策略推理获取动作块
+       - 应用插值和平滑
+       - 发送动作到机器人
+       - 统计性能指标
+       - 动态调整参数
+
+    性能统计:
+    ---------
+    - 循环频率: 外层循环的执行频率
+    - 动作频率: 实际发送到机器人的指令频率
+    - 网络延迟: 策略推理的延迟
+    - 缓存命中率: 预取器的缓存命中率
+    - 动作块利用率: 动作块执行时间占总时间的比例
+
+    参数:
+    -----
+    cfg : EvalConfig
+        评估配置对象,包含所有运行参数
+
+    示例:
+    -----
+    >>> cfg = EvalConfig(
+    ...     robot=so101_follower_config,
+    ...     policy_host="10.112.209.136",
+    ...     lang_instruction="Grab markers and place into pen holder."
+    ... )
+    >>> await eval_async(cfg)
+    """
+    # 步骤1：初始化日志系统
     init_logging()
     logging.info(pformat(asdict(cfg)))
     
@@ -936,20 +1490,22 @@ async def eval_async(cfg: EvalConfig):
     logging.getLogger().addHandler(file_handler)
     logging.info(f"日志文件: {log_file}")
 
-    # 步骤1：初始化机器人
+    # 步骤2：初始化机器人
     robot = make_robot_from_config(cfg.robot)
     robot.connect()
 
+    # 获取摄像头配置
     camera_keys = list(cfg.robot.cameras.keys())
     print("camera_keys: ", camera_keys)
 
     log_say("Initializing robot", cfg.play_sounds, blocking=True)
 
+    # 获取语言指令和机器人状态键
     language_instruction = cfg.lang_instruction
     robot_state_keys = list(robot._motors_ft.keys())
     print("robot_state_keys: ", robot_state_keys)
 
-    # 步骤2：初始化策略
+    # 步骤3：初始化策略推理客户端
     policy = Gr00tRobotInferenceClient(
         host=cfg.policy_host,
         port=cfg.policy_port,
@@ -962,10 +1518,12 @@ async def eval_async(cfg: EvalConfig):
         blocking=True,
     )
 
-    # 步骤3：创建线程锁保护机器人串口访问
+    # 步骤4：创建线程锁保护机器人串口访问
+    # 由于机器人串口是共享资源,需要使用锁来避免并发访问冲突
     robot_lock = threading.Lock()
     
-    # 步骤4：初始化视频流服务器（如果启用）
+    # 步骤5：初始化视频流服务器（如果启用）
+    # 提供Web界面实时查看摄像头画面
     video_stream_server = None
     if cfg.enable_video_stream:
         video_stream_server = VideoStreamServer(
@@ -976,12 +1534,13 @@ async def eval_async(cfg: EvalConfig):
         )
         video_stream_server.start()
     
-    # 步骤5：初始化观测预取器
+    # 步骤6：初始化观测预取器
+    # 使用环形缓存区异步预取观测数据,提高控制频率
     executor = ThreadPoolExecutor(max_workers=4)
     obs_prefetcher = ObservationPrefetcher(robot, executor, robot_lock)
     await obs_prefetcher.start()
     
-    # 步骤6：初始化平滑器和插值器
+    # 步骤7：初始化平滑器和插值器
     action_smoother = ActionSmoother(
         robot_state_keys,
         window_size=cfg.smoothing_window_size,
@@ -996,6 +1555,7 @@ async def eval_async(cfg: EvalConfig):
         interpolation_steps=cfg.interpolation_steps
     )
     
+    # 打印平滑配置信息
     print(f"平滑配置:")
     print(f"  方法: {cfg.smoothing_method}")
     print(f"  窗口大小: {cfg.smoothing_window_size}")
@@ -1008,8 +1568,10 @@ async def eval_async(cfg: EvalConfig):
         print(f"  过程噪声Q: {cfg.kalman_process_noise}")
         print(f"  测量噪声R: {cfg.kalman_measurement_noise}")
 
+    # 初始化前一个动作（用于速度限制）
     previous_action = None
     
+    # 创建关节平滑参数映射
     joint_alpha_map = {
         'shoulder_pan.pos': cfg.shoulder_pan_alpha,
         'shoulder_lift.pos': cfg.shoulder_lift_alpha,
@@ -1291,7 +1853,29 @@ async def eval_async(cfg: EvalConfig):
 
 @draccus.wrap()
 def eval(cfg: EvalConfig):
-    """主入口函数，根据配置选择异步或同步版本"""
+    """主入口函数 - 根据配置选择异步或同步版本
+
+    这是评估脚本的入口函数,根据配置参数选择运行异步版本还是同步版本。
+    默认使用异步版本,可以获得更好的性能。
+
+    参数:
+    -----
+    cfg : EvalConfig
+        评估配置对象,包含所有运行参数
+
+    返回:
+    -----
+    根据配置返回 eval_async 或 eval_sync 的执行结果
+
+    使用示例:
+    ---------
+    >>> cfg = EvalConfig(
+    ...     robot=so101_follower_config,
+    ...     policy_host="10.112.209.136",
+    ...     use_sync=False  # 使用异步版本
+    ... )
+    >>> eval(cfg)
+    """
     if cfg.use_sync:
         print("使用同步版本 (use_sync=True)")
         return eval_sync(cfg)
@@ -1302,7 +1886,45 @@ def eval(cfg: EvalConfig):
 
 @draccus.wrap()
 def eval_sync(cfg: EvalConfig):
-    """原始同步版本（用于性能对比）"""
+    """同步评估主函数 - 使用同步策略评估机器人性能
+
+    这是评估脚本的同步版本,用于性能对比测试。
+    与异步版本相比,同步版本没有使用观测预取和线程池优化,
+    因此性能较低,但代码更简单,便于理解和调试。
+
+    执行流程:
+    ---------
+    1. 初始化日志系统和配置
+    2. 连接并初始化机器人
+    3. 初始化GR00T策略推理客户端
+    4. 初始化平滑器和插值器
+    5. 进入主控制循环:
+       - 同步获取观测数据
+       - 同步调用策略推理获取动作块
+       - 应用插值和平滑
+       - 发送动作到机器人
+       - 统计性能指标
+
+    性能特点:
+    ---------
+    - 控制频率较低,因为每次循环都要等待观测和推理完成
+    - 代码结构简单,易于理解和调试
+    - 适合用于性能对比和问题排查
+
+    参数:
+    -----
+    cfg : EvalConfig
+        评估配置对象,包含所有运行参数
+
+    示例:
+    -----
+    >>> cfg = EvalConfig(
+    ...     robot=so101_follower_config,
+    ...     policy_host="10.112.209.136",
+    ...     use_sync=True  # 使用同步版本
+    ... )
+    >>> eval_sync(cfg)
+    """
     init_logging()
     logging.info(pformat(asdict(cfg)))
     
@@ -1318,16 +1940,18 @@ def eval_sync(cfg: EvalConfig):
     robot = make_robot_from_config(cfg.robot)
     robot.connect()
 
+    # 获取摄像头配置
     camera_keys = list(cfg.robot.cameras.keys())
     print("camera_keys: ", camera_keys)
 
     log_say("Initializing robot", cfg.play_sounds, blocking=True)
 
+    # 获取语言指令和机器人状态键
     language_instruction = cfg.lang_instruction
     robot_state_keys = list(robot._motors_ft.keys())
     print("robot_state_keys: ", robot_state_keys)
 
-    # 步骤2：初始化策略
+    # 步骤2：初始化策略推理客户端
     policy = Gr00tRobotInferenceClient(
         host=cfg.policy_host,
         port=cfg.policy_port,
@@ -1340,8 +1964,10 @@ def eval_sync(cfg: EvalConfig):
         blocking=True,
     )
 
+    # 初始化前一个动作（用于速度限制）
     previous_action = None
     
+    # 创建关节平滑参数映射
     joint_alpha_map = {
         'shoulder_pan.pos': cfg.shoulder_pan_alpha,
         'shoulder_lift.pos': cfg.shoulder_lift_alpha,
@@ -1370,6 +1996,7 @@ def eval_sync(cfg: EvalConfig):
         interpolation_steps=cfg.interpolation_steps
     )
     
+    # 打印平滑配置信息
     print(f"平滑配置:")
     print(f"  方法: {cfg.smoothing_method}")
     print(f"  窗口大小: {cfg.smoothing_window_size}")
@@ -1378,10 +2005,10 @@ def eval_sync(cfg: EvalConfig):
     print(f"  最大角度变化: {cfg.max_delta_pos} rad")
 
     # --- 频率和延迟统计变量初始化 ---
-    last_loop_time = time.time()
-    last_action_time = time.time()
-    loop_count = 0
-    action_count = 0
+    last_loop_time = time.time()  # 上一次循环的时间戳
+    last_action_time = time.time()  # 上一次动作执行的时间戳
+    loop_count = 0  # 循环计数器
+    action_count = 0  # 动作计数器
     print_interval = 1  # 外层循环打印间隔
     action_print_interval = 10  # 内层循环打印间隔（每10个动作打印一次）
     
@@ -1390,15 +2017,17 @@ def eval_sync(cfg: EvalConfig):
     max_latency_history = 100  # 保存最近100次延迟记录
     # ------------------------------------
 
-    # 步骤3：运行评估循环
+    # 步骤3：运行评估主循环
     while True:
         loop_start_time = time.time()
         
-        # 获取实时图像
+        # 获取实时观测数据
+        # 同步调用,会阻塞等待观测数据返回
         observation_dict = robot.get_observation()
         obs_time = time.time() - loop_start_time
         
         # 获取动作块（这部分包含网络延迟）
+        # 同步调用策略推理,会阻塞等待动作块返回
         policy_start_time = time.time()
         action_chunk, timing_info = policy.get_action(observation_dict, language_instruction)
         policy_time = time.time() - policy_start_time
@@ -1409,17 +2038,21 @@ def eval_sync(cfg: EvalConfig):
             network_latency_list.pop(0)
 
         # 应用插值（如果启用）
+        # 在动作块内进行线性插值,使运动更平滑
         if cfg.enable_interpolation:
             action_chunk = action_interpolator.interpolate_action_chunk(action_chunk)
 
         # 执行动作序列
+        # 遍历动作块中的每个动作,依次发送到机器人
         for i in range(len(action_chunk)):
             action_dict = action_chunk[i]
             
             # 应用平滑算法
+            # 使用配置的平滑算法对动作进行平滑处理,减少抖动
             smoothed_action = action_smoother.smooth(action_dict, joint_alpha_map)
             
             # 应用速度限制
+            # 限制单次控制周期内的最大关节角度变化,防止运动过快
             if previous_action is not None:
                 for key in smoothed_action:
                     smoothed_action[key] = rad_speed_limit(
@@ -1428,9 +2061,14 @@ def eval_sync(cfg: EvalConfig):
                         max_delta_pos=cfg.max_delta_pos
                     )
             
+            # 保存当前动作用于下一次速度限制
             previous_action = smoothed_action.copy()
             
+            # 发送动作到机器人
             robot.send_action(smoothed_action)
+            
+            # 等待控制周期
+            # 控制动作执行频率,确保稳定的控制周期
             time.sleep(cfg.ctrl_period)
             
             # 统计动作执行频率
@@ -1463,6 +2101,7 @@ def eval_sync(cfg: EvalConfig):
             min_latency = np.min(network_latency_list) * 1000
             max_latency = np.max(network_latency_list) * 1000
             
+            # 打印性能统计信息
             print(f"\n{'='*60}")
             print(f"[Loop {loop_count}] 性能统计 (同步版本)")
             print(f"{'='*60}")
@@ -1499,5 +2138,21 @@ def eval_sync(cfg: EvalConfig):
             last_loop_time = current_time
         # ------------------------------------
 
+
 if __name__ == "__main__":
+    """程序入口点
+
+    当直接运行此脚本时,调用 eval() 函数开始评估。
+    使用 draccus 库进行命令行参数解析。
+
+    使用示例:
+    ---------
+    python eval_lerobot.py \\
+        --robot.type=so101_follower \\
+        --robot.port=/dev/ttyACM0 \\
+        --robot.id=lil_guy \\
+        --robot.cameras="{ wrist: {type: opencv, index_or_path: 9}, front: {type: opencv, index_or_path: 15}}" \\
+        --policy_host=10.112.209.136 \\
+        --lang_instruction="Grab markers and place into pen holder."
+    """
     eval()
