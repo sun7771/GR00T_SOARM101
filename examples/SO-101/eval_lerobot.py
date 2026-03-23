@@ -63,9 +63,6 @@ from flask import Flask, Response, render_template_string  # Flask,用于视频�
 
 # ==================== LeRobot 库导入 ====================
 
-from lerobot.cameras.opencv.configuration_opencv import (  
-    OpenCVCameraConfig,  # OpenCV摄像头配置类
-)
 from lerobot.robots import (  
     Robot,  # 机器人基类
     RobotConfig,  # 机器人配置基类
@@ -114,6 +111,18 @@ class ActionSmoother:
               基于状态估计的最优滤波器
               特点: 适合处理带噪声的观测值，可调节过程噪声和测量噪声
     
+    - savgol_outlier: Savitzky-Golay滤波 + 离群值剔除
+              先使用IQR方法检测并剔除离群值，再应用Savitzky-Golay滤波
+              特点: 能有效去除异常突变点，同时保持信号形状，适合处理偶发异常
+    
+    - one_euro_outlier: One-Euro Filter + 离群值剔除
+              自适应低通滤波器，根据信号速度动态调整截止频率
+              特点: 在保持平滑的同时减少延迟，结合离群值检测增强鲁棒性
+    
+    - kalman_predict: 卡尔曼滤波 + 离群值剔除
+              基于状态估计的最优滤波器，结合IQR离群值检测
+              特点: 能够最优估计真实状态，同时抑制异常值干扰
+    
     使用示例:
     ---------
     >>> smoother = ActionSmoother(
@@ -135,7 +144,7 @@ class ActionSmoother:
         各关节的历史值存储
     """
     
-    def __init__(self, robot_state_keys, window_size=5, method='ema', dct_keep_ratio=0.5, savgol_window_length=5, kalman_process_noise=0.01, kalman_measurement_noise=0.1):
+    def __init__(self, robot_state_keys, window_size=5, method='ema', dct_keep_ratio=0.5, savgol_window_length=5, kalman_process_noise=0.01, kalman_measurement_noise=0.1, outlier_threshold=2.0, one_euro_min_cutoff=1.0, one_euro_beta=0.007, one_euro_d_cutoff=1.0):
         """
         初始化动作平滑器
         
@@ -149,7 +158,7 @@ class ActionSmoother:
             历史数据窗口大小，影响平滑程度
             值越大平滑效果越强，但延迟也越大
         method : str, 默认='ema'
-            平滑算法选择: 'ema', 'moving_avg', 'savgol', 'dct', 'kalman'
+            平滑算法选择: 'ema', 'moving_avg', 'savgol', 'dct', 'kalman', 'savgol_outlier', 'one_euro_outlier', 'kalman_predict'
         dct_keep_ratio : float, 默认=0.5
             DCT平滑时保留低频系数的比例 (0.0-1.0)
             值越小越平滑，但可能丢失细节
@@ -159,6 +168,14 @@ class ActionSmoother:
             卡尔曼滤波过程噪声Q，值越大响应越快但噪声更多
         kalman_measurement_noise : float, 默认=0.1
             卡尔曼滤波测量噪声R，值越大平滑效果越强
+        outlier_threshold : float, 默认=2.0
+            离群值检测阈值（基于IQR方法），值越小剔除越严格
+        one_euro_min_cutoff : float, 默认=1.0
+            One-Euro Filter最小截止频率（Hz），越小越平滑
+        one_euro_beta : float, 默认=0.007
+            One-Euro Filter截止频率斜率系数，越大跟踪越快
+        one_euro_d_cutoff : float, 默认=1.0
+            One-Euro Filter导数截止频率（Hz）
         """
         self.robot_state_keys = robot_state_keys
         self.window_size = window_size
@@ -172,6 +189,15 @@ class ActionSmoother:
         self.kalman_measurement_noise = kalman_measurement_noise
         self.kalman_x = {key: None for key in robot_state_keys}
         self.kalman_P = {key: None for key in robot_state_keys}
+        
+        self.outlier_threshold = outlier_threshold
+        
+        self.one_euro_min_cutoff = one_euro_min_cutoff
+        self.one_euro_beta = one_euro_beta
+        self.one_euro_d_cutoff = one_euro_d_cutoff
+        self.one_euro_x = {key: None for key in robot_state_keys}
+        self.one_euro_dx = {key: None for key in robot_state_keys}
+        self.one_euro_t = {key: None for key in robot_state_keys}
         
     def smooth(self, action_dict, joint_alpha_map):
         """
@@ -217,6 +243,21 @@ class ActionSmoother:
                     )
                 elif self.method == 'kalman':
                     smoothed_action[key] = self._kalman_smooth(
+                        action_dict[key], 
+                        key
+                    )
+                elif self.method == 'savgol_outlier':
+                    smoothed_action[key] = self._savgol_outlier_smooth(
+                        action_dict[key], 
+                        key
+                    )
+                elif self.method == 'one_euro_outlier':
+                    smoothed_action[key] = self._one_euro_outlier_smooth(
+                        action_dict[key], 
+                        key
+                    )
+                elif self.method == 'kalman_predict':
+                    smoothed_action[key] = self._kalman_predict_smooth(
                         action_dict[key], 
                         key
                     )
@@ -405,6 +446,226 @@ class ActionSmoother:
         self.history[key].append(self.kalman_x[key])
         if len(self.history[key]) > self.window_size:
             self.history[key].pop(0)
+        
+        return self.kalman_x[key]
+    
+    def _savgol_outlier_smooth(self, new_value, key):
+        """
+        Savitzky-Golay滤波 + 离群值剔除平滑
+        
+        先使用IQR方法检测并剔除离群值，然后对处理后的数据应用Savitzky-Golay滤波。
+        这种组合方法能有效去除异常突变点，同时保持信号的整体形状。
+        
+        参数:
+        -----
+        new_value : float
+            新的动作值
+        key : str
+            关节名称
+        
+        返回:
+        -----
+        float : 平滑后的值
+        
+        算法步骤:
+        ---------
+        1. 将新值添加到历史数据
+        2. 使用IQR方法检测离群值
+        3. 用中位数或插值替换离群值
+        4. 对处理后的数据应用Savitzky-Golay滤波
+        """
+        self.history[key].append(new_value)
+        if len(self.history[key]) > self.window_size:
+            self.history[key].pop(0)
+        
+        if len(self.history[key]) < 3:
+            return np.mean(self.history[key])
+        
+        data = np.array(self.history[key])
+        
+        Q1 = np.percentile(data, 25)
+        Q3 = np.percentile(data, 75)
+        IQR = Q3 - Q1
+        
+        lower_bound = Q1 - self.outlier_threshold * IQR
+        upper_bound = Q3 + self.outlier_threshold * IQR
+        
+        cleaned_data = data.copy()
+        outlier_mask = (data < lower_bound) | (data > upper_bound)
+        
+        if np.any(outlier_mask):
+            median_val = np.median(data[~outlier_mask]) if np.any(~outlier_mask) else np.median(data)
+            cleaned_data[outlier_mask] = median_val
+        
+        actual_window = min(len(cleaned_data), self.savgol_window_length)
+        if actual_window < 3:
+            actual_window = 3
+        if actual_window % 2 == 0:
+            actual_window -= 1
+        
+        smoothed = savgol_filter(cleaned_data, window_length=actual_window, polyorder=2)[-1]
+        
+        return smoothed
+    
+    def _one_euro_outlier_smooth(self, new_value, key):
+        """
+        One-Euro Filter + 离群值剔除平滑
+        
+        One-Euro Filter是一种自适应低通滤波器，能够根据信号速度动态调整截止频率，
+        在保持平滑的同时减少延迟。结合IQR离群值检测，先剔除异常值再应用滤波。
+        
+        参数:
+        -----
+        new_value : float
+            新的动作值
+        key : str
+            关节名称
+        
+        返回:
+        -----
+        float : 平滑后的值
+        
+        算法步骤:
+        ---------
+        1. 使用IQR方法检测离群值
+        2. 如果是离群值，用历史数据的中位数或One-Euro滤波值替换
+        3. 对处理后的值应用One-Euro Filter
+        4. 动态调整截止频率：cutoff = min_cutoff + beta * |dx|
+        """
+        current_time = time.time()
+        
+        if self.one_euro_x[key] is None:
+            self.one_euro_x[key] = new_value
+            self.one_euro_dx[key] = 0.0
+            self.one_euro_t[key] = current_time
+            self.history[key].append(new_value)
+            return new_value
+        
+        dt = current_time - self.one_euro_t[key]
+        if dt <= 0:
+            dt = 0.001
+        
+        self.history[key].append(new_value)
+        if len(self.history[key]) > self.window_size:
+            self.history[key].pop(0)
+        
+        data = np.array(self.history[key])
+        
+        Q1 = np.percentile(data, 25)
+        Q3 = np.percentile(data, 75)
+        IQR = Q3 - Q1
+        
+        lower_bound = Q1 - self.outlier_threshold * IQR
+        upper_bound = Q3 + self.outlier_threshold * IQR
+        
+        is_outlier = (new_value < lower_bound) | (new_value > upper_bound)
+        
+        if is_outlier and len(self.history[key]) > 1:
+            non_outlier_data = data[~((data < lower_bound) | (data > upper_bound))]
+            if len(non_outlier_data) > 0:
+                filtered_value = np.median(non_outlier_data)
+            else:
+                filtered_value = self.one_euro_x[key]
+        else:
+            filtered_value = new_value
+        
+        dx = (filtered_value - self.one_euro_x[key]) / dt
+        edx = self._one_euro_alpha(dt, self.one_euro_d_cutoff) * dx
+        self.one_euro_dx[key] = edx
+        
+        cutoff = self.one_euro_min_cutoff + self.one_euro_beta * abs(edx)
+        alpha = self._one_euro_alpha(dt, cutoff)
+        self.one_euro_x[key] = alpha * filtered_value + (1 - alpha) * self.one_euro_x[key]
+        self.one_euro_t[key] = current_time
+        
+        return self.one_euro_x[key]
+    
+    def _one_euro_alpha(self, dt, cutoff):
+        """
+        One-Euro Filter的alpha系数计算
+        
+        参数:
+        -----
+        dt : float
+            时间间隔（秒）
+        cutoff : float
+            截止频率（Hz）
+        
+        返回:
+        -----
+        float : alpha系数
+        """
+        tau = 1.0 / (2 * np.pi * cutoff)
+        return dt / (tau + dt)
+    
+    def _kalman_predict_smooth(self, new_value, key):
+        """
+        卡尔曼预测滤波 + 离群值剔除
+        
+        使用带速度预测的卡尔曼滤波器，结合IQR离群值检测。
+        在标准卡尔曼滤波基础上增加了基于速度的预测步骤，
+        能够更好地处理快速变化的信号，并抑制异常值。
+        
+        参数:
+        -----
+        new_value : float
+            新的动作值
+        key : str
+            关节名称
+        
+        返回:
+        -----
+        float : 滤波后的值
+        
+        算法步骤:
+        ---------
+        1. 使用IQR方法检测离群值
+        2. 如果是离群值，用预测值或历史值替换
+        3. 标准卡尔曼滤波预测-更新步骤
+        4. 维护状态[x, dx]（位置和速度）
+        """
+        self.history[key].append(new_value)
+        if len(self.history[key]) > self.window_size:
+            self.history[key].pop(0)
+        
+        Q = self.kalman_process_noise
+        R = self.kalman_measurement_noise
+        
+        if self.kalman_x[key] is None:
+            self.kalman_x[key] = new_value
+            self.kalman_P[key] = 1.0
+            return new_value
+        
+        data = np.array(self.history[key])
+        
+        Q1 = np.percentile(data, 25)
+        Q3 = np.percentile(data, 75)
+        IQR = Q3 - Q1
+        
+        lower_bound = Q1 - self.outlier_threshold * IQR
+        upper_bound = Q3 + self.outlier_threshold * IQR
+        
+        is_outlier = (new_value < lower_bound) | (new_value > upper_bound)
+        
+        if is_outlier:
+            if len(self.history[key]) > 1:
+                non_outlier_data = data[~((data < lower_bound) | (data > upper_bound))]
+                if len(non_outlier_data) > 0:
+                    filtered_value = np.median(non_outlier_data)
+                else:
+                    filtered_value = self.kalman_x[key]
+            else:
+                filtered_value = self.kalman_x[key]
+        else:
+            filtered_value = new_value
+        
+        x_pred = self.kalman_x[key]
+        P_pred = self.kalman_P[key] + Q
+        
+        K = P_pred / (P_pred + R)
+        
+        self.kalman_x[key] = x_pred + K * (filtered_value - x_pred)
+        self.kalman_P[key] = (1 - K) * P_pred
         
         return self.kalman_x[key]
 
@@ -1340,7 +1601,7 @@ class EvalConfig:
     ctrl_period: float = 0.003  # 控制周期，单位为秒 0.003s=333Hz
     
     # 平滑算法配置 
-    smoothing_method: str = "savgol"  # 平滑方法: 'ema', 'moving_avg', 'savgol', 'dct', 'kalman'
+    smoothing_method: str = "savgol"  # 平滑方法: 'ema', 'moving_avg', 'savgol', 'dct', 'kalman', 'savgol_outlier', 'one_euro_outlier', 'kalman_predict'
     smoothing_window_size: int = 10  # 平滑窗口大小
     savgol_window_length: int = 7  # Savitzky-Golay滤波窗口长度（必须为奇数且>=3）
     enable_interpolation: bool = True  # 是否启用动作块内插值
@@ -1352,6 +1613,14 @@ class EvalConfig:
     # 卡尔曼滤波配置
     kalman_process_noise: float = 0.05  # 过程噪声Q，越大响应越快但噪声更多
     kalman_measurement_noise: float = 0.05  # 测量噪声R，越大平滑效果越强
+    
+    # 离群值剔除配置（用于savgol_outlier、one_euro_outlier和kalman_predict方法）
+    outlier_threshold: float = 2.0  # 离群值检测阈值（基于IQR方法），值越小剔除越严格
+    
+    # One-Euro Filter配置（用于one_euro_outlier方法）
+    one_euro_min_cutoff: float = 1.0  # One-Euro Filter最小截止频率（Hz），越小越平滑
+    one_euro_beta: float = 0.007  # One-Euro Filter截止频率斜率系数，越大跟踪越快
+    one_euro_d_cutoff: float = 1.0  # One-Euro Filter导数截止频率（Hz）
     
     # 速度限制配置（减小以减少抖动）
     max_delta_pos: float = 0.15  # 最大关节角度变化（弧度）
@@ -1548,7 +1817,11 @@ async def eval_async(cfg: EvalConfig):
         dct_keep_ratio=cfg.dct_keep_ratio,
         savgol_window_length=cfg.savgol_window_length,
         kalman_process_noise=cfg.kalman_process_noise,
-        kalman_measurement_noise=cfg.kalman_measurement_noise
+        kalman_measurement_noise=cfg.kalman_measurement_noise,
+        outlier_threshold=cfg.outlier_threshold,
+        one_euro_min_cutoff=cfg.one_euro_min_cutoff,
+        one_euro_beta=cfg.one_euro_beta,
+        one_euro_d_cutoff=cfg.one_euro_d_cutoff
     )
     action_interpolator = ActionInterpolator(
         robot_state_keys,
@@ -1593,7 +1866,11 @@ async def eval_async(cfg: EvalConfig):
         dct_keep_ratio=cfg.dct_keep_ratio,
         savgol_window_length=cfg.savgol_window_length,
         kalman_process_noise=cfg.kalman_process_noise,
-        kalman_measurement_noise=cfg.kalman_measurement_noise
+        kalman_measurement_noise=cfg.kalman_measurement_noise,
+        outlier_threshold=cfg.outlier_threshold,
+        one_euro_min_cutoff=cfg.one_euro_min_cutoff,
+        one_euro_beta=cfg.one_euro_beta,
+        one_euro_d_cutoff=cfg.one_euro_d_cutoff
     )
     action_interpolator = ActionInterpolator(
         robot_state_keys,
@@ -1989,7 +2266,11 @@ def eval_sync(cfg: EvalConfig):
         dct_keep_ratio=cfg.dct_keep_ratio,
         savgol_window_length=cfg.savgol_window_length,
         kalman_process_noise=cfg.kalman_process_noise,
-        kalman_measurement_noise=cfg.kalman_measurement_noise
+        kalman_measurement_noise=cfg.kalman_measurement_noise,
+        outlier_threshold=cfg.outlier_threshold,
+        one_euro_min_cutoff=cfg.one_euro_min_cutoff,
+        one_euro_beta=cfg.one_euro_beta,
+        one_euro_d_cutoff=cfg.one_euro_d_cutoff
     )
     action_interpolator = ActionInterpolator(
         robot_state_keys,

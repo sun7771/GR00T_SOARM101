@@ -177,6 +177,7 @@ class BaseInferenceClient:
         """
         self.call_endpoint("kill", requires_input=False)
 
+    #调用服务端的接口
     def call_endpoint(
         self, endpoint: str, data: dict | None = None, requires_input: bool = True
     ) -> dict:
@@ -219,4 +220,5 @@ class ExternalRobotInferenceClient(BaseInferenceClient):
         The exact definition of the observations is defined
         by the policy, which contains the modalities configuration.
         """
+        #调用服务端的get_action接口，获取动作信息
         return self.call_endpoint("get_action", observations)
