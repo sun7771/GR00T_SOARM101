@@ -45,9 +45,10 @@ python eval_lerobot.py \\
 
 # ==================== 标准库导入 ====================
 import asyncio  # 异步编程支持,用于异步评估版本
+import json  # JSON数据处理,用于WebSocket消息解析
 import logging  # 日志记录,用于记录运行信息和错误
-import time  # 时间相关功能,用于性能统计和延时控制
 import threading  # 线程支持,用于并发执行和线程锁
+import time  # 时间相关功能,用于性能统计和延时控制
 from concurrent.futures import ThreadPoolExecutor  # 线程池执行器,用于异步执行阻塞操作
 from dataclasses import asdict, dataclass  # 数据类支持,用于配置类定义
 from pprint import pformat  # 格式化打印,用于美观地输出配置信息
@@ -60,6 +61,7 @@ import numpy as np  # NumPy,用于数值计算和数组操作
 from scipy.fftpack import dct, idct  # 离散余弦变换,用于DCT平滑算法
 from scipy.signal import savgol_filter  # Savitzky-Golay滤波器,用于信号平滑
 from flask import Flask, Response, render_template_string  # Flask,用于视频流Web服务器
+import websockets  # WebSocket客户端,用于接收远程控制信号
 
 # ==================== LeRobot 库导入 ====================
 from lerobot.cameras.opencv.configuration_opencv import (  
@@ -79,6 +81,236 @@ from lerobot.utils.utils import (
 
 # ==================== GR00T 模型服务导入 ====================
 from gr00t.eval.service import ExternalRobotInferenceClient  # GR00T外部推理客户端
+
+
+# ==================== 全局配置参数 (方便调试) ====================
+# GR00T策略推理服务器配置
+GR00T_POLICY_HOST = "localhost"  # GR00T服务器的主机地址
+GR00T_POLICY_PORT = 5555  # GR00T服务器的端口
+
+# WebSocket远程控制服务器配置
+WEBSOCKET_URI = "ws://192.168.0.198:8082"  # WebSocket服务器地址
+WEBSOCKET_MESSAGE_TYPE = "NAVS"  # 要监听的消息类型
+WEBSOCKET_REQUIRED_STATUS = "completed"  # 需要等待的状态值
+WEBSOCKET_TIMEOUT = 6000  # WebSocket等待超时时间（秒）
+
+# 评估配置参数
+ACTION_HORIZON = 4  # 从动作块中执行的动作数量
+LANG_INSTRUCTION = "Grab pens and place into pen holder."  # 自然语言任务描述
+PLAY_SOUNDS = False  # 是否播放声音提示
+TIMEOUT = 60  # 超时时间（秒）
+SHOW_IMAGES = False  # 是否显示图像预览
+USE_SYNC = False  # 是否使用同步版本（默认使用异步优化版本）
+ENABLE_VIDEO_STREAM = True  # 是否启用视频流服务
+VIDEO_STREAM_PORT = 5000  # 视频流服务器端口
+CTRL_PERIOD = 0.003  # 控制周期，单位为秒 0.003s=333Hz
+
+# 平滑算法配置
+SMOOTHING_METHOD = "one_euro_outlier"  # 平滑方法: 'ema', 'moving_avg', 'savgol', 'dct', 'kalman', 'savgol_outlier', 'one_euro_outlier', 'kalman_predict'
+SMOOTHING_WINDOW_SIZE = 10  # 平滑窗口大小
+SAVGOL_WINDOW_LENGTH = 7  # Savitzky-Golay滤波窗口长度（必须为奇数且>=3）
+ENABLE_INTERPOLATION = True  # 是否启用动作块内插值
+INTERPOLATION_STEPS = 10  # 每个动作之间的插值步数
+
+# DCT平滑配置
+DCT_KEEP_RATIO = 0.3  # DCT保留低频系数的比例 (0.1-0.9)，越小越平滑
+
+# 卡尔曼滤波配置
+KALMAN_PROCESS_NOISE = 0.05  # 过程噪声Q，越大响应越快但噪声更多
+KALMAN_MEASUREMENT_NOISE = 0.05  # 测量噪声R，越大平滑效果越强
+
+# 离群值剔除配置（用于savgol_outlier、one_euro_outlier和kalman_predict方法）
+OUTLIER_THRESHOLD = 4  # 离群值检测阈值（基于IQR方法），值越小剔除越严格
+
+# One-Euro Filter配置（用于one_euro_outlier方法）
+ONE_EURO_MIN_CUTOFF = 0.5  # One-Euro Filter最小截止频率（Hz），越小越平滑
+ONE_EURO_BETA = 0.1  # One-Euro Filter截止频率斜率系数，越大跟踪越快
+ONE_EURO_D_CUTOFF = 1.0  # One-Euro Filter导数截止频率（Hz）
+
+# 速度限制配置（减小以减少抖动）
+MAX_DELTA_POS = 0.15  # 最大关节角度变化（弧度）
+
+# 为每个关节设置不同的平滑参数
+# 关节顺序: ['shoulder_pan.pos', 'shoulder_lift.pos', 'elbow_flex.pos', 'wrist_flex.pos', 'wrist_roll.pos', 'gripper.pos']
+# 增加平滑系数以减少抖动（alpha越小越平滑）
+SHOULDER_PAN_ALPHA = 0.08  # 肩部转动 - 较大的关节，需要更多平滑
+SHOULDER_LIFT_ALPHA = 0.1  # 肩部抬升 - 承重关节，平滑一些
+ELBOW_FLEX_ALPHA = 0.08  # 肘部弯曲 - 中等平滑
+WRIST_FLEX_ALPHA = 0.15  # 腕部弯曲 - 精细动作，少一些平滑
+WRIST_ROLL_ALPHA = 0.15  # 腕部旋转 - 快速响应
+GRIPPER_ALPHA = 0.2  # 夹爪 - 需要更多平滑避免抖动
+
+# 动态调整配置
+ENABLE_ADAPTIVE = True  # 是否启用动态调整
+ADAPTIVE_INTERVAL = 5  # 动态调整间隔（循环次数）
+MIN_INTERPOLATION_STEPS = 2  # 最小插值步数
+MAX_INTERPOLATION_STEPS = 15  # 最大插值步数
+MIN_CTRL_PERIOD = 0.0005  # 最小控制周期（2000Hz）
+MAX_CTRL_PERIOD = 0.005  # 最大控制周期（200Hz）
+TARGET_UTILIZATION = 0.8  # 目标动作块利用率（80%）
+
+# WebSocket控制配置
+ENABLE_WEBSOCKET_CONTROL = True  # 是否启用WebSocket远程控制
+
+
+#################################################################################
+
+
+class WebSocketController:
+    """
+    WebSocket控制器 - 用于接收远程控制信号
+    
+    该类通过WebSocket连接到远程服务器,等待接收特定的控制消息。
+    当收到指定类型的消息(如NAVS completed)后,才会允许机器人执行动作。
+    同时支持接收动态的语言指令(lang_instruction)。
+    
+    主要功能:
+    ---------
+    - 建立WebSocket连接
+    - 监听并解析服务器消息
+    - 检查是否收到允许执行动作的信号
+    - 接收动态语言指令
+    - 提供同步和异步等待接口
+    
+    使用示例:
+    ---------
+    >>> controller = WebSocketController(
+    ...     uri="ws://localhost:8082",
+    ...     message_type="NAVS",
+    ...     required_status="completed"
+    ... )
+    >>> await controller.connect()
+    >>> await controller.wait_for_signal()
+    >>> lang_instruction = controller.get_lang_instruction()
+    >>> await controller.close()
+    """
+    
+    def __init__(self, uri=None, message_type=None, required_status=None):
+        """
+        初始化WebSocket控制器
+        
+        参数:
+        -----
+        uri : str, 默认=None (使用全局配置 WEBSOCKET_URI)
+            WebSocket服务器地址
+        message_type : str, 默认=None (使用全局配置 WEBSOCKET_MESSAGE_TYPE)
+            要监听的消息类型
+        required_status : str, 默认=None (使用全局配置 WEBSOCKET_REQUIRED_STATUS)
+            需要等待的状态值
+        """
+        self.uri = uri if uri is not None else WEBSOCKET_URI
+        self.message_type = message_type if message_type is not None else WEBSOCKET_MESSAGE_TYPE
+        self.required_status = required_status if required_status is not None else WEBSOCKET_REQUIRED_STATUS
+        self.websocket = None
+        self.received_signal = False
+        self.lang_instruction = None
+        self.lock = threading.Lock()
+        self.logger = logging.getLogger(__name__)
+    
+    async def connect(self):
+        """
+        连接到WebSocket服务器
+        
+        建立与服务器的WebSocket连接,并启动消息监听任务。
+        """
+        try:
+            self.logger.info(f"正在连接到WebSocket服务器: {self.uri}")
+            self.websocket = await websockets.connect(self.uri)
+            self.logger.info("WebSocket连接成功")
+        except Exception as e:
+            self.logger.error(f"WebSocket连接失败: {e}")
+            raise
+    
+    async def listen_for_messages(self):
+        """
+        监听WebSocket消息
+        
+        持续监听服务器发送的消息,当收到匹配的消息时设置信号标志。
+        支持两种消息类型:
+        1. 控制信号: {"type": "NAVS", "status": "completed"}
+        2. 语言指令: {"type": "lang_instruction", "string": "具体内容"}
+        """
+        try:
+            async for message in self.websocket:
+                try:
+                    data = json.loads(message)
+                    self.logger.debug(f"收到消息: {data}")
+                    
+                    # 处理控制信号
+                    if (data.get("type") == self.message_type and 
+                        data.get("status") == self.required_status):
+                        with self.lock:
+                            self.received_signal = True
+                        self.logger.info(f"收到允许信号: {self.message_type} {self.required_status}")
+                    
+                    # 处理语言指令
+                    elif data.get("type") == "lang_instruction" and "string" in data:
+                        with self.lock:
+                            self.lang_instruction = data["string"]
+                        self.logger.info(f"收到语言指令: {self.lang_instruction}")
+                        
+                except json.JSONDecodeError as e:
+                    self.logger.warning(f"消息解析失败: {e}")
+        except Exception as e:
+            self.logger.error(f"监听消息时出错: {e}")
+    
+    async def wait_for_signal(self, timeout=60):
+        """
+        等待允许执行动作的信号
+        
+        参数:
+        -----
+        timeout : int, 默认=60
+            等待超时时间(秒)
+        
+        返回:
+        -----
+        tuple : (是否收到信号, 语言指令)
+        """
+        self.logger.info(f"等待信号: {self.message_type} {self.required_status} (超时: {timeout}秒)")
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            with self.lock:
+                if self.received_signal:
+                    self.received_signal = False
+                    return True, self.lang_instruction
+            await asyncio.sleep(0.1)
+        
+        self.logger.warning(f"等待信号超时: {self.message_type} {self.required_status}")
+        return False, self.lang_instruction
+    
+    def get_lang_instruction(self):
+        """
+        获取当前的语言指令
+        
+        返回:
+        -----
+        str : 当前收到的语言指令，如果没有收到则返回None
+        """
+        with self.lock:
+            return self.lang_instruction
+    
+    def set_lang_instruction(self, instruction):
+        """
+        设置语言指令
+        
+        参数:
+        -----
+        instruction : str
+            要设置的语言指令
+        """
+        with self.lock:
+            self.lang_instruction = instruction
+            self.logger.info(f"设置语言指令: {instruction}")
+    
+    async def close(self):
+        """
+        关闭WebSocket连接
+        """
+        if self.websocket:
+            await self.websocket.close()
+            self.logger.info("WebSocket连接已关闭")
 
 
 #################################################################################
@@ -1313,8 +1545,8 @@ class Gr00tRobotInferenceClient:
     # 设置默认的 camera_keys 和 robot_state_keys
     def __init__(
         self,
-        host="localhost",
-        port=5555,
+        host=None,
+        port=None,
         camera_keys=[],
         robot_state_keys=[],
         show_images=False,
@@ -1323,9 +1555,9 @@ class Gr00tRobotInferenceClient:
 
         参数:
         -----
-        host : str, 默认="localhost"
+        host : str, 默认=None (使用全局配置 GR00T_POLICY_HOST)
             GR00T推理服务器的主机地址
-        port : int, 默认=5555
+        port : int, 默认=None (使用全局配置 GR00T_POLICY_PORT)
             GR00T推理服务器的端口号
         camera_keys : list
             摄像头键名列表,如 ['wrist', 'front']
@@ -1589,62 +1821,69 @@ class EvalConfig:
     ... )
     """
     robot: RobotConfig  # 要使用的机器人配置
-    policy_host: str = "localhost"  # gr00t服务器的主机地址
-    policy_port: int = 5555  # gr00t服务器的端口
-    action_horizon: int = 4  # 从动作块中执行的动作数量
-    lang_instruction: str = "Grab pens and place into pen holder."  # 自然语言任务描述
-    play_sounds: bool = False  # 是否播放声音提示
-    timeout: int = 60  # 超时时间（秒）
-    show_images: bool = False  # 是否显示图像预览
-    use_sync: bool = False  # 是否使用同步版本（默认使用异步优化版本）
-    enable_video_stream: bool = True  # 是否启用视频流服务
-    video_stream_port: int = 5000  # 视频流服务器端口
+    policy_host: str = GR00T_POLICY_HOST  # gr00t服务器的主机地址
+    policy_port: int = GR00T_POLICY_PORT  # gr00t服务器的端口
+    action_horizon: int = ACTION_HORIZON  # 从动作块中执行的动作数量
+    lang_instruction: str = LANG_INSTRUCTION  # 自然语言任务描述
+    play_sounds: bool = PLAY_SOUNDS  # 是否播放声音提示
+    timeout: int = TIMEOUT  # 超时时间（秒）
+    show_images: bool = SHOW_IMAGES  # 是否显示图像预览
+    use_sync: bool = USE_SYNC  # 是否使用同步版本（默认使用异步优化版本）
+    enable_video_stream: bool = ENABLE_VIDEO_STREAM  # 是否启用视频流服务
+    video_stream_port: int = VIDEO_STREAM_PORT  # 视频流服务器端口
 
-    ctrl_period: float = 0.003  # 控制周期，单位为秒 0.003s=333Hz
+    ctrl_period: float = CTRL_PERIOD  # 控制周期，单位为秒 0.003s=333Hz
     
     # 平滑算法配置 
-    smoothing_method: str = "one_euro_outlier"  # 平滑方法: 'ema', 'moving_avg', 'savgol', 'dct', 'kalman', 'savgol_outlier', 'one_euro_outlier', 'kalman_predict'
-    smoothing_window_size: int = 10  # 平滑窗口大小
-    savgol_window_length: int = 7  # Savitzky-Golay滤波窗口长度（必须为奇数且>=3）
-    enable_interpolation: bool = True  # 是否启用动作块内插值
-    interpolation_steps: int = 10 # 每个动作之间的插值步数
+    smoothing_method: str = SMOOTHING_METHOD  # 平滑方法: 'ema', 'moving_avg', 'savgol', 'dct', 'kalman', 'savgol_outlier', 'one_euro_outlier', 'kalman_predict'
+    smoothing_window_size: int = SMOOTHING_WINDOW_SIZE  # 平滑窗口大小
+    savgol_window_length: int = SAVGOL_WINDOW_LENGTH  # Savitzky-Golay滤波窗口长度（必须为奇数且>=3）
+    enable_interpolation: bool = ENABLE_INTERPOLATION  # 是否启用动作块内插值
+    interpolation_steps: int = INTERPOLATION_STEPS  # 每个动作之间的插值步数
     
     # DCT平滑配置
-    dct_keep_ratio: float = 0.3  # DCT保留低频系数的比例 (0.1-0.9)，越小越平滑
+    dct_keep_ratio: float = DCT_KEEP_RATIO  # DCT保留低频系数的比例 (0.1-0.9)，越小越平滑
     
     # 卡尔曼滤波配置
-    kalman_process_noise: float = 0.05  # 过程噪声Q，越大响应越快但噪声更多
-    kalman_measurement_noise: float = 0.05  # 测量噪声R，越大平滑效果越强
+    kalman_process_noise: float = KALMAN_PROCESS_NOISE  # 过程噪声Q，越大响应越快但噪声更多
+    kalman_measurement_noise: float = KALMAN_MEASUREMENT_NOISE  # 测量噪声R，越大平滑效果越强
     
     # 离群值剔除配置（用于savgol_outlier、one_euro_outlier和kalman_predict方法）
-    outlier_threshold: float = 4  # 离群值检测阈值（基于IQR方法），值越小剔除越严格
+    outlier_threshold: float = OUTLIER_THRESHOLD  # 离群值检测阈值（基于IQR方法），值越小剔除越严格
     
     # One-Euro Filter配置（用于one_euro_outlier方法）
-    one_euro_min_cutoff: float = 0.5  # One-Euro Filter最小截止频率（Hz），越小越平滑 0.5
-    one_euro_beta: float = 0.1  # One-Euro Filter截止频率斜率系数，越大跟踪越快0.1
-    one_euro_d_cutoff: float = 1.0  # One-Euro Filter导数截止频率（Hz）1.0
+    one_euro_min_cutoff: float = ONE_EURO_MIN_CUTOFF  # One-Euro Filter最小截止频率（Hz），越小越平滑 0.5
+    one_euro_beta: float = ONE_EURO_BETA  # One-Euro Filter截止频率斜率系数，越大跟踪越快0.1
+    one_euro_d_cutoff: float = ONE_EURO_D_CUTOFF  # One-Euro Filter导数截止频率（Hz）1.0
     
     # 速度限制配置（减小以减少抖动）
-    max_delta_pos: float = 0.15  # 最大关节角度变化（弧度）
+    max_delta_pos: float = MAX_DELTA_POS  # 最大关节角度变化（弧度）
     
     # 为每个关节设置不同的平滑参数
     # 关节顺序: ['shoulder_pan.pos', 'shoulder_lift.pos', 'elbow_flex.pos', 'wrist_flex.pos', 'wrist_roll.pos', 'gripper.pos']
     # 增加平滑系数以减少抖动（alpha越小越平滑）
-    shoulder_pan_alpha: float = 0.08    # 肩部转动 - 较大的关节，需要更多平滑
-    shoulder_lift_alpha: float = 0.1  # 肩部抬升 - 承重关节，平滑一些
-    elbow_flex_alpha: float = 0.08     # 肘部弯曲 - 中等平滑
-    wrist_flex_alpha: float = 0.15      # 腕部弯曲 - 精细动作，少一些平滑
-    wrist_roll_alpha: float = 0.15     # 腕部旋转 - 快速响应
-    gripper_alpha: float = 0.2         # 夹爪 - 需要更多平滑避免抖动
+    shoulder_pan_alpha: float = SHOULDER_PAN_ALPHA  # 肩部转动 - 较大的关节，需要更多平滑
+    shoulder_lift_alpha: float = SHOULDER_LIFT_ALPHA  # 肩部抬升 - 承重关节，平滑一些
+    elbow_flex_alpha: float = ELBOW_FLEX_ALPHA  # 肘部弯曲 - 中等平滑
+    wrist_flex_alpha: float = WRIST_FLEX_ALPHA  # 腕部弯曲 - 精细动作，少一些平滑
+    wrist_roll_alpha: float = WRIST_ROLL_ALPHA  # 腕部旋转 - 快速响应
+    gripper_alpha: float = GRIPPER_ALPHA  # 夹爪 - 需要更多平滑避免抖动
     
     # 动态调整配置
-    enable_adaptive: bool = True  # 是否启用动态调整
-    adaptive_interval: int = 5  # 动态调整间隔（循环次数）
-    min_interpolation_steps: int = 2  # 最小插值步数
-    max_interpolation_steps: int = 15  # 最大插值步数
-    min_ctrl_period: float = 0.0005  # 最小控制周期（2000Hz）
-    max_ctrl_period: float = 0.005  # 最大控制周期（200Hz）
-    target_utilization: float = 0.8  # 目标动作块利用率（80%）
+    enable_adaptive: bool = ENABLE_ADAPTIVE  # 是否启用动态调整
+    adaptive_interval: int = ADAPTIVE_INTERVAL  # 动态调整间隔（循环次数）
+    min_interpolation_steps: int = MIN_INTERPOLATION_STEPS  # 最小插值步数
+    max_interpolation_steps: int = MAX_INTERPOLATION_STEPS  # 最大插值步数
+    min_ctrl_period: float = MIN_CTRL_PERIOD  # 最小控制周期（2000Hz）
+    max_ctrl_period: float = MAX_CTRL_PERIOD  # 最大控制周期（200Hz）
+    target_utilization: float = TARGET_UTILIZATION  # 目标动作块利用率（80%）
+    
+    # WebSocket控制配置
+    enable_websocket_control: bool = ENABLE_WEBSOCKET_CONTROL  # 是否启用WebSocket远程控制
+    websocket_uri: str = WEBSOCKET_URI  # WebSocket服务器地址
+    websocket_message_type: str = WEBSOCKET_MESSAGE_TYPE  # 要监听的消息类型
+    websocket_required_status: str = WEBSOCKET_REQUIRED_STATUS  # 需要等待的状态值
+    websocket_timeout: int = WEBSOCKET_TIMEOUT  # WebSocket等待超时时间（秒）
 
 
 def rad_speed_limit(target_pos, current_pos, max_delta_pos=0.5):
@@ -1775,19 +2014,11 @@ async def eval_async(cfg: EvalConfig):
     language_instruction = cfg.lang_instruction
     robot_state_keys = list(robot._motors_ft.keys())
     print("robot_state_keys: ", robot_state_keys)
-
-    # 步骤3：初始化策略推理客户端
-    policy = Gr00tRobotInferenceClient(
-        host=cfg.policy_host,
-        port=cfg.policy_port,
-        camera_keys=camera_keys,
-        robot_state_keys=robot_state_keys,
-    )
-    log_say(
-        "Initializing policy client with language instruction: " + language_instruction,
-        cfg.play_sounds,
-        blocking=True,
-    )
+    
+    # 步骤3：初始化策略推理客户端（延迟连接）
+    # 只有在收到WebSocket的NAVS completed和lang_instruction消息后才连接动作服务器
+    policy = None
+    policy_connected = False
 
     # 步骤4：创建线程锁保护机器人串口访问
     # 由于机器人串口是共享资源,需要使用锁来避免并发访问冲突
@@ -1804,6 +2035,41 @@ async def eval_async(cfg: EvalConfig):
             port=cfg.video_stream_port
         )
         video_stream_server.start()
+    
+    # 步骤5.5：初始化WebSocket控制器（如果启用）
+    # 用于接收远程控制信号，等待NAVS completed和lang_instruction消息后才连接动作服务器
+    websocket_controller = None
+    listen_task = None
+    if cfg.enable_websocket_control:
+        websocket_controller = WebSocketController(
+            uri=cfg.websocket_uri,
+            message_type=cfg.websocket_message_type,
+            required_status=cfg.websocket_required_status
+        )
+        try:
+            await websocket_controller.connect()
+            logging.info(f"WebSocket控制器已启动，等待 {cfg.websocket_message_type} {cfg.websocket_required_status} 信号和lang_instruction消息")
+            
+            # 启动消息监听任务
+            listen_task = asyncio.create_task(websocket_controller.listen_for_messages())
+            
+            # 等待收到第一条消息（NAVS completed或lang_instruction）
+            logging.info("等待第一条WebSocket消息...")
+            signal_received, first_lang_instruction = await websocket_controller.wait_for_signal(timeout=cfg.websocket_timeout)
+            
+            if first_lang_instruction is not None:
+                language_instruction = first_lang_instruction
+                logging.info(f"收到初始语言指令: {language_instruction}")
+            
+            if signal_received:
+                logging.info(f"收到 {cfg.websocket_message_type} {cfg.websocket_required_status} 信号，准备连接动作服务器")
+            else:
+                logging.warning(f"等待超时，将使用默认配置继续执行")
+                
+        except Exception as e:
+            logging.error(f"WebSocket控制器初始化失败: {e}")
+            logging.warning("将继续执行，不等待WebSocket信号")
+            websocket_controller = None
     
     # 步骤6：初始化观测预取器
     # 使用环形缓存区异步预取观测数据,提高控制频率
@@ -1934,6 +2200,24 @@ async def eval_async(cfg: EvalConfig):
         while True:
             loop_start_time = time.time()
             
+            # 检查是否需要连接动作服务器
+            # 只有在收到WebSocket的NAVS completed消息后才连接动作服务器
+            if not policy_connected and websocket_controller is not None:
+                logging.info("连接动作服务器...")
+                policy = Gr00tRobotInferenceClient(
+                    host=cfg.policy_host,
+                    port=cfg.policy_port,
+                    camera_keys=camera_keys,
+                    robot_state_keys=robot_state_keys,
+                )
+                log_say(
+                    "Initializing policy client with language instruction: " + language_instruction,
+                    cfg.play_sounds,
+                    blocking=True,
+                )
+                policy_connected = True
+                logging.info(f"动作服务器已连接，使用语言指令: {language_instruction}")
+            
             # 直接获取最新观测数据（不使用预取器缓存，避免动作回退）
             obs_start_time = time.time()
             loop = asyncio.get_event_loop()
@@ -1970,6 +2254,18 @@ async def eval_async(cfg: EvalConfig):
             # 应用插值（如果启用）
             if cfg.enable_interpolation:
                 action_chunk = action_interpolator.interpolate_action_chunk(action_chunk)
+
+            # 等待WebSocket信号（如果启用）
+            # 在执行动作前等待收到NAVS completed消息，并获取最新的语言指令
+            if websocket_controller is not None:
+                signal_received, new_lang_instruction = await websocket_controller.wait_for_signal(timeout=cfg.websocket_timeout)
+                if not signal_received:
+                    logging.warning(f"未收到 {cfg.websocket_message_type} {cfg.websocket_required_status} 信号，跳过本次动作执行")
+                    continue
+                # 如果收到新的语言指令，更新当前的语言指令
+                if new_lang_instruction is not None:
+                    language_instruction = new_lang_instruction
+                    logging.info(f"更新语言指令: {language_instruction}")
 
             # 执行动作序列（保持同步以确保精确时序）
             for i in range(len(action_chunk)):
@@ -2122,6 +2418,8 @@ async def eval_async(cfg: EvalConfig):
         # 清理资源
         if video_stream_server:
             video_stream_server.stop()
+        if websocket_controller:
+            await websocket_controller.close()
         await obs_prefetcher.close()
         executor.shutdown(wait=True)
         
@@ -2163,7 +2461,6 @@ def eval(cfg: EvalConfig):
         return asyncio.run(eval_async(cfg))
 
 
-@draccus.wrap()
 def eval_sync(cfg: EvalConfig):
     """同步评估主函数 - 使用同步策略评估机器人性能
 
@@ -2229,19 +2526,42 @@ def eval_sync(cfg: EvalConfig):
     language_instruction = cfg.lang_instruction
     robot_state_keys = list(robot._motors_ft.keys())
     print("robot_state_keys: ", robot_state_keys)
-
-    # 步骤2：初始化策略推理客户端
-    policy = Gr00tRobotInferenceClient(
-        host=cfg.policy_host,
-        port=cfg.policy_port,
-        camera_keys=camera_keys,
-        robot_state_keys=robot_state_keys,
-    )
-    log_say(
-        "Initializing policy client with language instruction: " + language_instruction,
-        cfg.play_sounds,
-        blocking=True,
-    )
+    
+    # 步骤2：初始化策略推理客户端（延迟连接）
+    # 只有在收到WebSocket的NAVS completed和lang_instruction消息后才连接动作服务器
+    policy = None
+    policy_connected = False
+    
+    # 步骤2.5：初始化WebSocket控制器（如果启用）
+    # 用于接收远程控制信号，等待NAVS completed和lang_instruction消息后才连接动作服务器
+    websocket_controller = None
+    if cfg.enable_websocket_control:
+        websocket_controller = WebSocketController(
+            uri=cfg.websocket_uri,
+            message_type=cfg.websocket_message_type,
+            required_status=cfg.websocket_required_status
+        )
+        try:
+            asyncio.run(websocket_controller.connect())
+            logging.info(f"WebSocket控制器已启动，等待 {cfg.websocket_message_type} {cfg.websocket_required_status} 信号和lang_instruction消息")
+            
+            # 等待收到第一条消息（NAVS completed或lang_instruction）
+            logging.info("等待第一条WebSocket消息...")
+            signal_received, first_lang_instruction = asyncio.run(websocket_controller.wait_for_signal(timeout=cfg.websocket_timeout))
+            
+            if first_lang_instruction is not None:
+                language_instruction = first_lang_instruction
+                logging.info(f"收到初始语言指令: {language_instruction}")
+            
+            if signal_received:
+                logging.info(f"收到 {cfg.websocket_message_type} {cfg.websocket_required_status} 信号，准备连接动作服务器")
+            else:
+                logging.warning(f"等待超时，将使用默认配置继续执行")
+                
+        except Exception as e:
+            logging.error(f"WebSocket控制器初始化失败: {e}")
+            logging.warning("将继续执行，不等待WebSocket信号")
+            websocket_controller = None
 
     # 初始化前一个动作（用于速度限制）
     previous_action = None
@@ -2301,130 +2621,166 @@ def eval_sync(cfg: EvalConfig):
     # ------------------------------------
 
     # 步骤3：运行评估主循环
-    while True:
-        loop_start_time = time.time()
-        
-        # 获取实时观测数据
-        # 同步调用,会阻塞等待观测数据返回
-        observation_dict = robot.get_observation()
-        obs_time = time.time() - loop_start_time
-        
-        # 获取动作块（这部分包含网络延迟）
-        # 同步调用策略推理,会阻塞等待动作块返回
-        policy_start_time = time.time()
-        action_chunk, timing_info = policy.get_action(observation_dict, language_instruction)
-        policy_time = time.time() - policy_start_time
-        
-        # 记录网络延迟
-        network_latency_list.append(policy_time)
-        if len(network_latency_list) > max_latency_history:
-            network_latency_list.pop(0)
+    try:
+        while True:
+            loop_start_time = time.time()
+            
+            # 检查是否需要连接动作服务器
+            # 只有在收到WebSocket的NAVS completed消息后才连接动作服务器
+            if not policy_connected and websocket_controller is not None:
+                logging.info("连接动作服务器...")
+                policy = Gr00tRobotInferenceClient(
+                    host=cfg.policy_host,
+                    port=cfg.policy_port,
+                    camera_keys=camera_keys,
+                    robot_state_keys=robot_state_keys,
+                )
+                log_say(
+                    "Initializing policy client with language instruction: " + language_instruction,
+                    cfg.play_sounds,
+                    blocking=True,
+                )
+                policy_connected = True
+                logging.info(f"动作服务器已连接，使用语言指令: {language_instruction}")
+            
+            # 获取实时观测数据
+            # 同步调用,会阻塞等待观测数据返回
+            observation_dict = robot.get_observation()
+            obs_time = time.time() - loop_start_time
+            
+            # 获取动作块（这部分包含网络延迟）
+            # 同步调用策略推理,会阻塞等待动作块返回
+            policy_start_time = time.time()
+            action_chunk, timing_info = policy.get_action(observation_dict, language_instruction)
+            policy_time = time.time() - policy_start_time
+            
+            # 记录网络延迟
+            network_latency_list.append(policy_time)
+            if len(network_latency_list) > max_latency_history:
+                network_latency_list.pop(0)
 
-        # 应用插值（如果启用）
-        # 在动作块内进行线性插值,使运动更平滑
-        if cfg.enable_interpolation:
-            action_chunk = action_interpolator.interpolate_action_chunk(action_chunk)
+            # 应用插值（如果启用）
+            # 在动作块内进行线性插值,使运动更平滑
+            if cfg.enable_interpolation:
+                action_chunk = action_interpolator.interpolate_action_chunk(action_chunk)
+            
+            # 等待WebSocket信号（如果启用）
+            # 在执行动作前等待收到NAVS completed消息，并获取最新的语言指令
+            if websocket_controller is not None:
+                signal_received, new_lang_instruction = asyncio.run(websocket_controller.wait_for_signal(timeout=cfg.websocket_timeout))
+                if not signal_received:
+                    logging.warning(f"未收到 {cfg.websocket_message_type} {cfg.websocket_required_status} 信号，跳过本次动作执行")
+                    continue
+                # 如果收到新的语言指令，更新当前的语言指令
+                if new_lang_instruction is not None:
+                    language_instruction = new_lang_instruction
+                    logging.info(f"更新语言指令: {language_instruction}")
 
-        # 执行动作序列
-        # 遍历动作块中的每个动作,依次发送到机器人
-        for i in range(len(action_chunk)):
-            action_dict = action_chunk[i]
-            
-            # 应用平滑算法
-            # 使用配置的平滑算法对动作进行平滑处理,减少抖动
-            smoothed_action = action_smoother.smooth(action_dict, joint_alpha_map)
-            
-            # 应用速度限制
-            # 限制单次控制周期内的最大关节角度变化,防止运动过快
-            if previous_action is not None:
-                for key in smoothed_action:
-                    smoothed_action[key] = rad_speed_limit(
-                        target_pos=smoothed_action[key],
-                        current_pos=previous_action[key],
-                        max_delta_pos=cfg.max_delta_pos
-                    )
-            
-            # 保存当前动作用于下一次速度限制
-            previous_action = smoothed_action.copy()
-            
-            # 发送动作到机器人
-            robot.send_action(smoothed_action)
-            
-            # 等待控制周期
-            # 控制动作执行频率,确保稳定的控制周期
-            time.sleep(cfg.ctrl_period)
-            
-            # 统计动作执行频率
-            action_count += 1
-            if action_count % action_print_interval == 0:
+            # 执行动作序列
+            # 遍历动作块中的每个动作,依次发送到机器人
+            for i in range(len(action_chunk)):
+                action_dict = action_chunk[i]
+                
+                # 应用平滑算法
+                # 使用配置的平滑算法对动作进行平滑处理,减少抖动
+                smoothed_action = action_smoother.smooth(action_dict, joint_alpha_map)
+                
+                # 应用速度限制
+                # 限制单次控制周期内的最大关节角度变化,防止运动过快
+                if previous_action is not None:
+                    for key in smoothed_action:
+                        smoothed_action[key] = rad_speed_limit(
+                            target_pos=smoothed_action[key],
+                            current_pos=previous_action[key],
+                            max_delta_pos=cfg.max_delta_pos
+                        )
+                
+                # 保存当前动作用于下一次速度限制
+                previous_action = smoothed_action.copy()
+                
+                # 发送动作到机器人
+                robot.send_action(smoothed_action)
+                
+                # 等待控制周期
+                # 控制动作执行频率,确保稳定的控制周期
+                time.sleep(cfg.ctrl_period)
+                
+                # 统计动作执行频率
+                action_count += 1
+                if action_count % action_print_interval == 0:
+                    current_time = time.time()
+                    action_dt = current_time - last_action_time
+                    action_fps = action_print_interval / action_dt
+                    print(f"\r[Action] 执行频率: {action_fps:.2f} Hz", end="")
+                    last_action_time = current_time
+
+            # --- 外层循环频率和网络延迟统计 ---
+            loop_count += 1
+            if loop_count % print_interval == 0:
                 current_time = time.time()
-                action_dt = current_time - last_action_time
-                action_fps = action_print_interval / action_dt
-                print(f"\r[Action] 执行频率: {action_fps:.2f} Hz", end="")
-                last_action_time = current_time
-
-        # --- 外层循环频率和网络延迟统计 ---
-        loop_count += 1
-        if loop_count % print_interval == 0:
-            current_time = time.time()
-            dt = current_time - last_loop_time
-            loop_fps = print_interval / dt
-            
-            # 计算实际执行的动作数量（考虑插值）
-            actual_action_count = len(action_chunk) if cfg.enable_interpolation else cfg.action_horizon
-            total_action_fps = (print_interval * actual_action_count) / dt
-            
-            # 计算动作块执行时间和利用率
-            action_execution_time = actual_action_count * cfg.ctrl_period
-            idle_time = dt - action_execution_time
-            action_chunk_utilization = (action_execution_time / dt) * 100 if dt > 0 else 0
-            
-            # 计算网络延迟统计
-            avg_latency = np.mean(network_latency_list) * 1000  # 毫秒
-            min_latency = np.min(network_latency_list) * 1000
-            max_latency = np.max(network_latency_list) * 1000
-            
-            # 打印性能统计信息
-            print(f"\n{'='*60}")
-            print(f"[Loop {loop_count}] 性能统计 (同步版本)")
-            print(f"{'='*60}")
-            print(f"周期频率: {loop_fps:.2f} Hz | 实际指令频率: {total_action_fps:.2f} Hz")
-            print(f"获取观测耗时: {obs_time*1000:.2f} ms")
-            print(f"策略推理耗时: {policy_time*1000:.2f} ms")
-            print(f"总循环耗时: {dt*1000:.2f} ms")
-            print(f"\n动作块利用统计:")
-            print(f"  动作块长度: {cfg.action_horizon} | 插值后: {actual_action_count}")
-            print(f"  动作执行时间: {action_execution_time*1000:.2f} ms")
-            print(f"  空闲时间: {idle_time*1000:.2f} ms")
-            print(f"  动作块利用率: {action_chunk_utilization:.1f}%")
-            print(f"\n网络延迟统计 (最近{len(network_latency_list)}次):")
-            print(f"  平均延迟: {avg_latency:.2f} ms")
-            print(f"  最小延迟: {min_latency:.2f} ms")
-            print(f"  最大延迟: {max_latency:.2f} ms")
-            print(f"{'='*60}")
-            
-            logging.info(f"[Loop {loop_count}] 性能统计 (同步版本)")
-            logging.info(f"周期频率: {loop_fps:.2f} Hz | 实际指令频率: {total_action_fps:.2f} Hz")
-            logging.info(f"获取观测耗时: {obs_time*1000:.2f} ms")
-            logging.info(f"策略推理耗时: {policy_time*1000:.2f} ms")
-            logging.info(f"总循环耗时: {dt*1000:.2f} ms")
-            logging.info(f"动作块利用统计:")
-            logging.info(f"  动作块长度: {cfg.action_horizon} | 插值后: {actual_action_count}")
-            logging.info(f"  动作执行时间: {action_execution_time*1000:.2f} ms")
-            logging.info(f"  空闲时间: {idle_time*1000:.2f} ms")
-            logging.info(f"  动作块利用率: {action_chunk_utilization:.1f}%")
-            logging.info(f"网络延迟统计 (最近{len(network_latency_list)}次):")
-            logging.info(f"  平均延迟: {avg_latency:.2f} ms")
-            logging.info(f"  最小延迟: {min_latency:.2f} ms")
-            logging.info(f"  最大延迟: {max_latency:.2f} ms")
-            logging.info(f"{'='*60}")
-            last_loop_time = current_time
+                dt = current_time - last_loop_time
+                loop_fps = print_interval / dt
+                
+                # 计算实际执行的动作数量（考虑插值）
+                actual_action_count = len(action_chunk) if cfg.enable_interpolation else cfg.action_horizon
+                total_action_fps = (print_interval * actual_action_count) / dt
+                
+                # 计算动作块执行时间和利用率
+                action_execution_time = actual_action_count * cfg.ctrl_period
+                idle_time = dt - action_execution_time
+                action_chunk_utilization = (action_execution_time / dt) * 100 if dt > 0 else 0
+                
+                # 计算网络延迟统计
+                avg_latency = np.mean(network_latency_list) * 1000  # 毫秒
+                min_latency = np.min(network_latency_list) * 1000
+                max_latency = np.max(network_latency_list) * 1000
+                
+                # 打印性能统计信息
+                print(f"\n{'='*60}")
+                print(f"[Loop {loop_count}] 性能统计 (同步版本)")
+                print(f"{'='*60}")
+                print(f"周期频率: {loop_fps:.2f} Hz | 实际指令频率: {total_action_fps:.2f} Hz")
+                print(f"获取观测耗时: {obs_time*1000:.2f} ms")
+                print(f"策略推理耗时: {policy_time*1000:.2f} ms")
+                print(f"总循环耗时: {dt*1000:.2f} ms")
+                print(f"\n动作块利用统计:")
+                print(f"  动作块长度: {cfg.action_horizon} | 插值后: {actual_action_count}")
+                print(f"  动作执行时间: {action_execution_time*1000:.2f} ms")
+                print(f"  空闲时间: {idle_time*1000:.2f} ms")
+                print(f"  动作块利用率: {action_chunk_utilization:.1f}%")
+                print(f"\n网络延迟统计 (最近{len(network_latency_list)}次):")
+                print(f"  平均延迟: {avg_latency:.2f} ms")
+                print(f"  最小延迟: {min_latency:.2f} ms")
+                print(f"  最大延迟: {max_latency:.2f} ms")
+                print(f"{'='*60}")
+                
+                logging.info(f"[Loop {loop_count}] 性能统计 (同步版本)")
+                logging.info(f"周期频率: {loop_fps:.2f} Hz | 实际指令频率: {total_action_fps:.2f} Hz")
+                logging.info(f"获取观测耗时: {obs_time*1000:.2f} ms")
+                logging.info(f"策略推理耗时: {policy_time*1000:.2f} ms")
+                logging.info(f"总循环耗时: {dt*1000:.2f} ms")
+                logging.info(f"动作块利用统计:")
+                logging.info(f"  动作块长度: {cfg.action_horizon} | 插值后: {actual_action_count}")
+                logging.info(f"  动作执行时间: {action_execution_time*1000:.2f} ms")
+                logging.info(f"  空闲时间: {idle_time*1000:.2f} ms")
+                logging.info(f"  动作块利用率: {action_chunk_utilization:.1f}%")
+                logging.info(f"网络延迟统计 (最近{len(network_latency_list)}次):")
+                logging.info(f"  平均延迟: {avg_latency:.2f} ms")
+                logging.info(f"  最小延迟: {min_latency:.2f} ms")
+                logging.info(f"  最大延迟: {max_latency:.2f} ms")
+                logging.info(f"{'='*60}")
+                last_loop_time = current_time
         # ------------------------------------
+    
+    finally:
+        # 清理资源
+        if websocket_controller:
+            asyncio.run(websocket_controller.close())
 
 
 if __name__ == "__main__":
     """程序入口点
-
+1
     当直接运行此脚本时,调用 eval() 函数开始评估。
     使用 draccus 库进行命令行参数解析。
 
