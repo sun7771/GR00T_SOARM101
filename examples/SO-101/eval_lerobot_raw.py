@@ -1,47 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""
-This is the new Gr00T policy eval script with so100, so101 robot arm. Based on:
-https://github.com/huggingface/lerobot/pull/777
-
-Example command:
-
-```shell
-
-python eval_gr00t_so100.py \
-    --robot.type=so100_follower \
-    --robot.port=/dev/ttyACM0 \
-    --robot.id=lil_guy \
-    --robot.cameras="{ wrist: {type: opencv, index_or_path: 9, width: 640, height: 480, fps: 30}, front: {type: opencv, index_or_path: 15, width: 640, height: 480, fps: 30}}" \
-    --policy_host=10.112.209.136 \
-    --lang_instruction="Grab markers and place into pen holder."
-```
-
-
-First replay to ensure the robot is working:
-```shell
-python -m lerobot.replay \
-    --robot.type=so100_follower \
-    --robot.port=/dev/ttyACM0 \
-    --robot.id=lil_guy \
-    --dataset.repo_id=youliangtan/so100-table-cleanup \
-    --dataset.episode=2
-```
-"""
-
 import logging
 import time
 from dataclasses import asdict, dataclass
@@ -107,9 +63,6 @@ class Gr00tRobotInferenceClient:
         obs_dict = {}
         for key in self.camera_keys:
             img = observation_dict[key]
-            # 在发送到服务器之前将图像调整为224x224
-            if img.shape[:2] != (224, 224):
-                img = cv2.resize(img, (224, 224), interpolation=cv2.INTER_LINEAR)
             obs_dict[f"video.{key}"] = img
 
         # 显示图像
@@ -212,9 +165,6 @@ def view_img(img, overlay_img=None):
     plt.clf()  # 清除图像以显示下一帧
 
 
-def print_yellow(text):
-    print("\033[93m {}\033[00m".format(text))
-
 
 @dataclass
 class EvalConfig:
@@ -230,22 +180,7 @@ class EvalConfig:
 
     ctrl_period: float = 0.001  # 控制周期，单位为秒 0.001s=1000Hz
     
-    # 为每个关节设置不同的平滑参数
-    # 关节顺序: ['shoulder_pan.pos', 'shoulder_lift.pos', 'elbow_flex.pos', 'wrist_flex.pos', 'wrist_roll.pos', 'gripper.pos']
-    # shoulder_pan_alpha: float = 0.15    # 肩部转动 - 较大的关节，需要更多平滑
-    # shoulder_lift_alpha: float = 0.15  # 肩部抬升 - 承重关节，平滑一些
-    # elbow_flex_alpha: float = 0.15     # 肘部弯曲 - 中等平滑
-    # wrist_flex_alpha: float = 0.15      # 腕部弯曲 - 精细动作，少一些平滑
-    # wrist_roll_alpha: float = 0.15     # 腕部旋转 - 快速响应
-    # gripper_alpha: float = 0.25         # 夹爪 - 需要更多平滑避免抖动
-
-    # shoulder_pan_alpha:     float = 0.15    # 肩部转动 - 较大的关节，需要更多平滑
-    # shoulder_lift_alpha:    float = 0.15  # 肩部抬升 - 承重关节，平滑一些
-    # elbow_flex_alpha:       float = 0.15     # 肘部弯曲 - 中等平滑
-    # wrist_flex_alpha:       float = 0.15      # 腕部弯曲 - 精细动作，少一些平滑
-    # wrist_roll_alpha:       float = 0.15     # 腕部旋转 - 快速响应
-    # gripper_alpha:          float = 0.25         # 夹爪 - 需要更多平滑避免抖动
-
+    
     shoulder_pan_alpha: float = 0.15    # 肩部转动 - 较大的关节，需要更多平滑
     shoulder_lift_alpha: float = 0.2  # 肩部抬升 - 承重关节，平滑一些
     shoulder_lift_alpha: float = 0.2  # 肩部抬升 - 承重关节，平滑一些
@@ -272,7 +207,7 @@ def rad_speed_limit(target_pos, current_pos, max_delta_pos=0.5):
 
     return limited_target_pos
 
-# ... (前面的代码保持不变: SPDX, Imports, Gr00tRobotInferenceClient, view_img, rad_speed_limit) ...
+
 
 @draccus.wrap()
 def eval(cfg: EvalConfig):
