@@ -89,14 +89,14 @@ GR00T_POLICY_HOST = "localhost"  # GR00T服务器的主机地址
 GR00T_POLICY_PORT = 5555  # GR00T服务器的端口
 
 # WebSocket远程控制服务器配置
-WEBSOCKET_URI = "ws://192.168.0.198:8082"  # WebSocket服务器地址
+WEBSOCKET_URI = "ws://192.168.0.200:8082"  # WebSocket服务器地址
 WEBSOCKET_MESSAGE_TYPE = "NAVS"  # 要监听的消息类型
 WEBSOCKET_REQUIRED_STATUS = "completed"  # 需要等待的状态值
-WEBSOCKET_TIMEOUT = 6000  # WebSocket等待超时时间（秒）
+WEBSOCKET_TIMEOUT = 6000000  # WebSocket等待超时时间（秒）
 
 # 评估配置参数
 ACTION_HORIZON = 4  # 从动作块中执行的动作数量
-LANG_INSTRUCTION = "Grab pens and place into pen holder."  # 自然语言任务描述
+LANG_INSTRUCTION = "Take the item out of the box and put it on the floor"  # 自然语言任务描述
 PLAY_SOUNDS = False  # 是否播放声音提示
 TIMEOUT = 60  # 超时时间（秒）
 SHOW_IMAGES = False  # 是否显示图像预览
@@ -254,31 +254,27 @@ class WebSocketController:
         except Exception as e:
             self.logger.error(f"监听消息时出错: {e}")
     
-    async def wait_for_signal(self, timeout=60):
+    async def wait_for_signal(self, timeout=None):
         """
-        等待允许执行动作的信号
+        等待允许执行动作的信号（死等）
         
         参数:
         -----
-        timeout : int, 默认=60
-            等待超时时间(秒)
+        timeout : int, 默认=None
+            等待超时时间(秒)，设置为None时无限等待
         
         返回:
         -----
         tuple : (是否收到信号, 语言指令)
         """
-        self.logger.info(f"等待信号: {self.message_type} {self.required_status} (超时: {timeout}秒)")
+        self.logger.info(f"等待信号: {self.message_type} {self.required_status} (死等)")
         
-        start_time = time.time()
-        while time.time() - start_time < timeout:
+        while True:
             with self.lock:
                 if self.received_signal:
                     self.received_signal = False
                     return True, self.lang_instruction
             await asyncio.sleep(0.1)
-        
-        self.logger.warning(f"等待信号超时: {self.message_type} {self.required_status}")
-        return False, self.lang_instruction
     
     def get_lang_instruction(self):
         """
@@ -1993,7 +1989,7 @@ async def eval_async(cfg: EvalConfig):
     logging.info(pformat(asdict(cfg)))
     
     # 配置日志文件输出
-    log_file = "eval_performance.log"
+    log_file = "log/eval_performance.log"
     file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
@@ -2053,18 +2049,28 @@ async def eval_async(cfg: EvalConfig):
             # 启动消息监听任务
             listen_task = asyncio.create_task(websocket_controller.listen_for_messages())
             
-            # 等待收到第一条消息（NAVS completed或lang_instruction）
-            logging.info("等待第一条WebSocket消息...")
-            signal_received, first_lang_instruction = await websocket_controller.wait_for_signal(timeout=cfg.websocket_timeout)
+            # 等待同时收到NAVS completed信号和语言指令
+            logging.info("等待WebSocket消息: 需要同时收到NAVS completed信号和语言指令")
             
-            if first_lang_instruction is not None:
-                language_instruction = first_lang_instruction
-                logging.info(f"收到初始语言指令: {language_instruction}")
+            # 重置信号状态
+            websocket_controller.received_signal = False
+            websocket_controller.lang_instruction = None
             
-            if signal_received:
-                logging.info(f"收到 {cfg.websocket_message_type} {cfg.websocket_required_status} 信号，准备连接动作服务器")
-            else:
-                logging.warning(f"等待超时，将使用默认配置继续执行")
+            # 等待同时满足两个条件
+            while True:
+                signal_received, first_lang_instruction = await websocket_controller.wait_for_signal()
+                
+                # 检查是否同时满足两个条件
+                if signal_received and websocket_controller.lang_instruction is not None:
+                    language_instruction = websocket_controller.lang_instruction
+                    logging.info(f"收到NAVS completed信号和语言指令: {language_instruction}")
+                    logging.info(f"条件满足，准备连接动作服务器")
+                    break
+                elif signal_received:
+                    logging.info("收到NAVS completed信号，等待语言指令...")
+                elif first_lang_instruction is not None:
+                    language_instruction = first_lang_instruction
+                    logging.info(f"收到语言指令: {language_instruction}，等待NAVS completed信号...")
                 
         except Exception as e:
             logging.error(f"WebSocket控制器初始化失败: {e}")
@@ -2201,7 +2207,7 @@ async def eval_async(cfg: EvalConfig):
             loop_start_time = time.time()
             
             # 检查是否需要连接动作服务器
-            # 只有在收到WebSocket的NAVS completed消息后才连接动作服务器
+            # 只有在收到WebSocket的NAVS completed消息和语言指令后才连接动作服务器
             if not policy_connected and websocket_controller is not None:
                 logging.info("连接动作服务器...")
                 policy = Gr00tRobotInferenceClient(
@@ -2217,6 +2223,8 @@ async def eval_async(cfg: EvalConfig):
                 )
                 policy_connected = True
                 logging.info(f"动作服务器已连接，使用语言指令: {language_instruction}")
+                # 连接成功后，重置信号状态，以便后续可以接收新的语言指令
+                websocket_controller.received_signal = False
             
             # 直接获取最新观测数据（不使用预取器缓存，避免动作回退）
             obs_start_time = time.time()
@@ -2255,13 +2263,10 @@ async def eval_async(cfg: EvalConfig):
             if cfg.enable_interpolation:
                 action_chunk = action_interpolator.interpolate_action_chunk(action_chunk)
 
-            # 等待WebSocket信号（如果启用）
-            # 在执行动作前等待收到NAVS completed消息，并获取最新的语言指令
+            # 检查是否有新的语言指令（如果启用WebSocket）
             if websocket_controller is not None:
-                signal_received, new_lang_instruction = await websocket_controller.wait_for_signal(timeout=cfg.websocket_timeout)
-                if not signal_received:
-                    logging.warning(f"未收到 {cfg.websocket_message_type} {cfg.websocket_required_status} 信号，跳过本次动作执行")
-                    continue
+                # 直接获取语言指令，不等待信号
+                new_lang_instruction = websocket_controller.get_lang_instruction()
                 # 如果收到新的语言指令，更新当前的语言指令
                 if new_lang_instruction is not None:
                     language_instruction = new_lang_instruction
@@ -2626,7 +2631,7 @@ def eval_sync(cfg: EvalConfig):
             loop_start_time = time.time()
             
             # 检查是否需要连接动作服务器
-            # 只有在收到WebSocket的NAVS completed消息后才连接动作服务器
+            # 只有在收到WebSocket的NAVS completed消息和语言指令后才连接动作服务器
             if not policy_connected and websocket_controller is not None:
                 logging.info("连接动作服务器...")
                 policy = Gr00tRobotInferenceClient(
@@ -2642,6 +2647,8 @@ def eval_sync(cfg: EvalConfig):
                 )
                 policy_connected = True
                 logging.info(f"动作服务器已连接，使用语言指令: {language_instruction}")
+                # 连接成功后，重置信号状态，以便后续可以接收新的语言指令
+                websocket_controller.received_signal = False
             
             # 获取实时观测数据
             # 同步调用,会阻塞等待观测数据返回
@@ -2664,13 +2671,10 @@ def eval_sync(cfg: EvalConfig):
             if cfg.enable_interpolation:
                 action_chunk = action_interpolator.interpolate_action_chunk(action_chunk)
             
-            # 等待WebSocket信号（如果启用）
-            # 在执行动作前等待收到NAVS completed消息，并获取最新的语言指令
+            # 检查是否有新的语言指令（如果启用WebSocket）
             if websocket_controller is not None:
-                signal_received, new_lang_instruction = asyncio.run(websocket_controller.wait_for_signal(timeout=cfg.websocket_timeout))
-                if not signal_received:
-                    logging.warning(f"未收到 {cfg.websocket_message_type} {cfg.websocket_required_status} 信号，跳过本次动作执行")
-                    continue
+                # 直接获取语言指令，不等待信号
+                new_lang_instruction = websocket_controller.get_lang_instruction()
                 # 如果收到新的语言指令，更新当前的语言指令
                 if new_lang_instruction is not None:
                     language_instruction = new_lang_instruction
